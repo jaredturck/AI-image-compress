@@ -16,6 +16,7 @@ CHECKPOINT_PATH = Path('checkpoints/latest.pt')
 LEARNING_RATE = 1e-4
 LAMBDA = 0.010
 MAX_STEPS = 15000
+BATCH_SIZE = 8
 
 class ImageDataset(Dataset):
     ''' Load and transform training images. '''
@@ -49,7 +50,7 @@ def prepare_data():
         v2.ToDtype(torch.float32, scale=True)
     ])
     dataset = ImageDataset(image_paths, transform)
-    return DataLoader(dataset, batch_size=8, shuffle=True, num_workers=6, pin_memory=True, persistent_workers=True)
+    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=6, pin_memory=True, persistent_workers=True)
 
 def save_checkpoint(model, accelerator):
     ''' Save the latest training checkpoint. '''
