@@ -17,8 +17,8 @@ CHECKPOINT_DIR = PROJECT_DIR / 'checkpoints'
 COMPRESSED_DIR = PROJECT_DIR / 'compressed_images'
 MAGIC = b'NIC3'
 HEADER = struct.Struct('<4s16sIII')
-SOURCE_PREVIEW_SIZE = (480, 360)
-OUTPUT_PREVIEW_SIZE = (480, 360)
+PREVIEW_PADDING = 24
+PREVIEW_RESIZE_DELAY = 50
 
 def read_file(path):
     ''' Read and validate a compressed NIC image file. '''
@@ -120,8 +120,12 @@ def format_file_size(size):
         return f'{size / 1024:.1f} KB'
     return f'{size} bytes'
 
-def make_preview(image, size):
-    ''' Build a scaled CustomTkinter image without changing codec input. '''
+def make_preview(image, available_width, available_height):
+    ''' Build a fitted CustomTkinter image without changing codec input. '''
+    available_width = max(1, available_width - PREVIEW_PADDING)
+    available_height = max(1, available_height - PREVIEW_PADDING)
+    scale = min(available_width / image.width, available_height / image.height, 1.0)
+    size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
     preview = image.copy()
     preview.thumbnail(size)
     return ctk.CTkImage(light_image=preview, dark_image=preview, size=preview.size)
@@ -142,9 +146,12 @@ class CodecGUI:
         self.model_id = None
         self.checkpoint_path = None
         self.source_path = None
+        self.source_image = None
         self.source_preview = None
+        self.reconstruction_image = None
         self.reconstruction_preview = None
         self.compressed_path = None
+        self.preview_resize_job = None
         self.worker_pool = ThreadPoolExecutor(max_workers=1)
         self.worker_future = None
         self.worker_callback = None
@@ -154,12 +161,7 @@ class CodecGUI:
         self.source_info_var = tk.StringVar(value='Open an image to begin.')
         self.output_info_var = tk.StringVar(value='Compress and decode an image to compare the reconstruction.')
         self.checkpoint_var = tk.StringVar(value='No checkpoint loaded')
-        self.original_size_var = tk.StringVar(value='-')
-        self.compressed_size_var = tk.StringVar(value='-')
-        self.reduction_var = tk.StringVar(value='-')
-        self.ratio_var = tk.StringVar(value='-')
-        self.bpp_var = tk.StringVar(value='-')
-        self.saved_path_var = tk.StringVar(value='Not compressed yet')
+        self.metrics_var = tk.StringVar(value='No compression statistics yet')
 
         self.build_header()
         self.build_panels()
@@ -215,11 +217,12 @@ class CodecGUI:
         ctk.CTkLabel(panel, textvariable=self.source_info_var, anchor='w', text_color='#9c9c9c').grid(
             row=2, column=0, sticky='ew', padx=18, pady=(2, 10))
 
-        preview_frame = ctk.CTkFrame(panel, corner_radius=12, fg_color='#171717')
-        preview_frame.grid(row=3, column=0, sticky='nsew', padx=18, pady=(0, 14))
-        preview_frame.grid_columnconfigure(0, weight=1)
-        preview_frame.grid_rowconfigure(0, weight=1)
-        self.source_preview_label = ctk.CTkLabel(preview_frame, text='No source image', text_color='#777777')
+        self.source_preview_frame = ctk.CTkFrame(panel, corner_radius=12, fg_color='#171717')
+        self.source_preview_frame.grid(row=3, column=0, sticky='nsew', padx=18, pady=(0, 14))
+        self.source_preview_frame.grid_columnconfigure(0, weight=1)
+        self.source_preview_frame.grid_rowconfigure(0, weight=1)
+        self.source_preview_frame.bind('<Configure>', self.schedule_preview_resize)
+        self.source_preview_label = ctk.CTkLabel(self.source_preview_frame, text='No source image', text_color='#777777')
         self.source_preview_label.grid(row=0, column=0, sticky='nsew', padx=12, pady=12)
 
         self.compress_button = ctk.CTkButton(panel, text='Compress', height=42, state='disabled', command=self.compress)
@@ -239,31 +242,20 @@ class CodecGUI:
         ctk.CTkLabel(panel, text='Decoded from the saved .nic file on disk.', anchor='w', text_color='#6f9fd8').grid(
             row=2, column=0, sticky='ew', padx=18, pady=(2, 10))
 
-        preview_frame = ctk.CTkFrame(panel, corner_radius=12, fg_color='#171717')
-        preview_frame.grid(row=3, column=0, sticky='nsew', padx=18, pady=(0, 12))
-        preview_frame.grid_columnconfigure(0, weight=1)
-        preview_frame.grid_rowconfigure(0, weight=1)
-        self.output_preview_label = ctk.CTkLabel(preview_frame, text='No reconstruction yet', text_color='#777777')
+        self.output_preview_frame = ctk.CTkFrame(panel, corner_radius=12, fg_color='#171717')
+        self.output_preview_frame.grid(row=3, column=0, sticky='nsew', padx=18, pady=(0, 12))
+        self.output_preview_frame.grid_columnconfigure(0, weight=1)
+        self.output_preview_frame.grid_rowconfigure(0, weight=1)
+        self.output_preview_frame.bind('<Configure>', self.schedule_preview_resize)
+        self.output_preview_label = ctk.CTkLabel(self.output_preview_frame, text='No reconstruction yet', text_color='#777777')
         self.output_preview_label.grid(row=0, column=0, sticky='nsew', padx=12, pady=12)
 
-        stats = ctk.CTkFrame(panel, corner_radius=12)
-        stats.grid(row=4, column=0, sticky='ew', padx=18, pady=(0, 12))
-        stats.grid_columnconfigure(1, weight=1)
-        self.add_stat_row(stats, 0, 'Original size', self.original_size_var)
-        self.add_stat_row(stats, 1, 'Compressed size', self.compressed_size_var)
-        self.add_stat_row(stats, 2, 'Size reduction', self.reduction_var)
-        self.add_stat_row(stats, 3, 'Compression ratio', self.ratio_var)
-        self.add_stat_row(stats, 4, 'Bits / pixel', self.bpp_var)
-        ctk.CTkLabel(stats, textvariable=self.saved_path_var, anchor='w', text_color='#8d8d8d', wraplength=520).grid(
-            row=5, column=0, columnspan=2, sticky='ew', padx=12, pady=(6, 10))
+        metrics = ctk.CTkLabel(panel, textvariable=self.metrics_var, anchor='w', height=30, corner_radius=8,
+            fg_color='#303030', text_color='#b5b5b5', font=ctk.CTkFont(size=12))
+        metrics.grid(row=4, column=0, sticky='ew', padx=18, pady=(0, 10))
 
         self.decode_button = ctk.CTkButton(panel, text='Decode', height=42, state='disabled', command=self.decode)
         self.decode_button.grid(row=5, column=0, sticky='ew', padx=18, pady=(0, 18))
-
-    def add_stat_row(self, parent, row, label, variable):
-        ''' Add one compression statistic to the output panel. '''
-        ctk.CTkLabel(parent, text=label, text_color='#9c9c9c').grid(row=row, column=0, sticky='w', padx=12, pady=3)
-        ctk.CTkLabel(parent, textvariable=variable, anchor='e').grid(row=row, column=1, sticky='e', padx=12, pady=3)
 
     def build_status_bar(self):
         ''' Build the status line at the bottom of the window. '''
@@ -324,9 +316,8 @@ class CodecGUI:
             return
 
         self.source_path = Path(path)
-        source_image = to_pil_image(image)
-        self.source_preview = make_preview(source_image, SOURCE_PREVIEW_SIZE)
-        self.source_preview_label.configure(image=self.source_preview, text='')
+        self.source_image = to_pil_image(image)
+        self.refresh_previews()
         self.source_name_var.set(self.source_path.name)
         self.source_info_var.set(f'{image.shape[2]} x {image.shape[1]} pixels | original dimensions preserved')
         self.clear_compressed_result()
@@ -336,16 +327,32 @@ class CodecGUI:
     def clear_compressed_result(self):
         ''' Clear output state that belongs to a previous source or checkpoint. '''
         self.compressed_path = None
+        # CustomTkinter leaves the underlying Tk image unchanged when image=None.
+        self.output_preview_label.configure(image='', text='No reconstruction yet')
+        self.reconstruction_image = None
         self.reconstruction_preview = None
-        self.output_preview_label.configure(image=None, text='No reconstruction yet')
         self.output_info_var.set('Compress and decode an image to compare the reconstruction.')
-        self.original_size_var.set('-')
-        self.compressed_size_var.set('-')
-        self.reduction_var.set('-')
-        self.ratio_var.set('-')
-        self.bpp_var.set('-')
-        self.saved_path_var.set('Not compressed yet')
+        self.metrics_var.set('No compression statistics yet')
         self.update_action_states()
+
+    def schedule_preview_resize(self, _event=None):
+        ''' Refresh image previews after the preview area changes size. '''
+        if self.preview_resize_job is not None:
+            self.root.after_cancel(self.preview_resize_job)
+        self.preview_resize_job = self.root.after(PREVIEW_RESIZE_DELAY, self.refresh_previews)
+
+    def refresh_previews(self):
+        ''' Fit complete source and reconstruction images inside their preview areas. '''
+        self.preview_resize_job = None
+
+        if self.source_image is not None:
+            self.source_preview = make_preview(self.source_image, self.source_preview_frame.winfo_width(), self.source_preview_frame.winfo_height())
+            self.source_preview_label.configure(image=self.source_preview, text='')
+
+        if self.reconstruction_image is not None:
+            self.reconstruction_preview = make_preview(self.reconstruction_image, self.output_preview_frame.winfo_width(),
+                self.output_preview_frame.winfo_height())
+            self.output_preview_label.configure(image=self.reconstruction_preview, text='')
 
     def compress(self):
         ''' Compress the selected source image into the project output folder. '''
@@ -363,13 +370,13 @@ class CodecGUI:
         self.compressed_path = stats['output_path']
         ratio = stats['input_size'] / stats['compressed_size']
         reduction = (1.0 - stats['compressed_size'] / stats['input_size']) * 100.0
-        self.original_size_var.set(format_file_size(stats['input_size']))
-        self.compressed_size_var.set(format_file_size(stats['compressed_size']))
-        self.reduction_var.set(f'{reduction:.1f}%')
-        self.ratio_var.set(f'{ratio:.2f}x')
-        self.bpp_var.set(f'{stats["bpp"]:.3f}')
-        self.saved_path_var.set(str(self.compressed_path.relative_to(PROJECT_DIR)))
-        self.status_var.set('Compression complete. Click Decode to reconstruct the saved file.')
+        original_size = format_file_size(stats['input_size'])
+        compressed_size = format_file_size(stats['compressed_size'])
+        metrics_text = f'Original {original_size} | Compressed {compressed_size} | Reduction {reduction:.1f}% | ' \
+            f'Ratio {ratio:.2f}x | {stats["bpp"]:.3f} bpp'
+        self.metrics_var.set(metrics_text)
+        saved_path = self.compressed_path.relative_to(PROJECT_DIR)
+        self.status_var.set(f'Compression complete: {saved_path}. Click Decode to reconstruct it.')
 
     def decode(self):
         ''' Read the saved NIC file from disk and reconstruct its image. '''
@@ -385,9 +392,8 @@ class CodecGUI:
             self.status_var.set(stats['error'])
             return
 
-        reconstruction = to_pil_image(stats['image'])
-        self.reconstruction_preview = make_preview(reconstruction, OUTPUT_PREVIEW_SIZE)
-        self.output_preview_label.configure(image=self.reconstruction_preview, text='')
+        self.reconstruction_image = to_pil_image(stats['image'])
+        self.refresh_previews()
         self.output_info_var.set(f'{stats["width"]} x {stats["height"]} pixels')
         self.status_var.set('Decode complete. The reconstruction was read from the saved .nic file.')
 
