@@ -123,7 +123,3 @@ class ImageCodec(CompressionModel):
         indexes = self.gaussian_conditional.build_indexes(scales_hat)
         y_hat = self.gaussian_conditional.decompress(strings[0], indexes, z_hat.dtype)
         return self.decoder(y_hat).clamp_(0, 1)
-
-
-def count_parameters(model):
-    return sum(parameter.numel() for parameter in model.parameters())
