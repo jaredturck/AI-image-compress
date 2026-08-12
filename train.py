@@ -147,6 +147,16 @@ def prepare_data(accelerator):
     return DataLoader(cache, batch_size=BATCH_SIZE, shuffle=True, num_workers=6, pin_memory=True, persistent_workers=True,
         prefetch_factor=4, drop_last=True)
 
+def load_checkpoint(model):
+    ''' Load the newest checkpoint weights when available. '''
+    checkpoints = list(CHECKPOINT_DIR.glob('checkpoint_*.pt'))
+    if not checkpoints:
+        return None
+
+    checkpoint_path = max(checkpoints, key=lambda path: path.stat().st_mtime)
+    model.load_state_dict(torch.load(checkpoint_path, map_location='cpu', weights_only=True))
+    return checkpoint_path
+
 def save_checkpoint(model, accelerator):
     ''' Save a checkpoint in a three-file rolling window. '''
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -176,11 +186,13 @@ def main():
         return
 
     model = ImageCodec()
+    checkpoint_path = load_checkpoint(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, fused=True)
     model, optimizer = accelerator.prepare(model, optimizer)
 
     if accelerator.is_main_process:
-        print(f'Training started | batch size {BATCH_SIZE} | {MAX_STEPS:,} batches')
+        weights = checkpoint_path.name if checkpoint_path else 'random'
+        print(f'Training started | batch size {BATCH_SIZE} | {MAX_STEPS:,} batches | weights {weights}')
 
     model.train()
     step = 0
@@ -195,6 +207,7 @@ def main():
             mse = F.mse_loss(reconstruction, batch)
             loss = bpp + LAMBDA * (255.0 ** 2) * mse
             accelerator.backward(loss)
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             step += 1
 
