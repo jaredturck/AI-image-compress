@@ -11,16 +11,17 @@ from torch.utils.data import DataLoader
 from torchvision.io import decode_image, decode_jpeg, read_file
 from torchvision.transforms import v2
 from tqdm import tqdm
-
 from model import ImageCodec
+
+# accelerate launch --multi_gpu --num_processes 2 --mixed_precision bf16 train.py
 
 DATA_DIR = Path('/mnt/8TB_HDD/datasets/anime_dataset/train/')
 CHECKPOINT_DIR = Path('checkpoints')
 LEARNING_RATE = 1e-4
 LAMBDA = 0.010
 MAX_STEPS = 15000
-MAX_IMAGES = 50_000
-BATCH_SIZE = 32
+MAX_IMAGES = 100_000
+BATCH_SIZE = 128
 STOP_CHECK_INTERVAL = 100
 STOP_MIN_DELTA = 0.01
 STOP_PATIENCE = 5
