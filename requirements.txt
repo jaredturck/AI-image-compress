@@ -3,3 +3,5 @@ torchvision>=0.19
 accelerate>=1.0
 compressai>=1.2.8,<2
 tqdm>=4.66
+customtkinter>=5.2
+pillow>=10.0

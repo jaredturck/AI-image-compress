@@ -1,6 +1,6 @@
 ''' Train the neural image codec. '''
 
-import os, queue, random, threading, time
+import os, queue, threading, time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
@@ -21,87 +21,113 @@ LAMBDA = 0.010
 MAX_STEPS = 15000
 MAX_IMAGES = 20000
 BATCH_SIZE = 32
+STOP_LOSS = 1.0
+STOP_CHECK_INTERVAL = 100
+STOP_PATIENCE = 3
+IMAGE_SIZE = 256
+JPEG_BATCH_SIZE = 64
+MAX_JPEG_FUTURES = 4
+MAX_CPU_FUTURES = 64
+CPU_WORKERS = 6
 
 def read_images(filenames, encoded_queue):
     ''' Continuously read encoded image files into the preparation queue. '''
     for filename in filenames:
         try:
             encoded = read_file(DATA_DIR / filename)
+
         except (OSError, RuntimeError):
             encoded = None
+
         encoded_queue.put((filename, encoded))
+
     encoded_queue.put(None)
 
 def prepare_cpu_image(encoded, transform):
     ''' Decode and prepare one non-JPEG image on the CPU. '''
     try:
         return transform(decode_image(encoded, mode='RGB'))
+
     except RuntimeError:
         return None
 
 def prepare_jpegs(items, transform, device):
     ''' Decode and prepare a JPEG batch on the local GPU. '''
     encoded = [item[1] for item in items]
+
     try:
         images = decode_jpeg(encoded, mode='RGB', device=device)
         return torch.stack([transform(image) for image in images]).cpu()
+
     except RuntimeError:
         prepared = []
+
         for image_data in encoded:
             try:
                 image = decode_jpeg(image_data, mode='RGB', device=device)
                 prepared.append(transform(image))
+
             except RuntimeError:
                 continue
+
         if not prepared:
             return None
+
         return torch.stack(prepared).cpu()
 
 def store_prepared(cache, cache_size, prepared):
     ''' Copy prepared images into the contiguous RAM cache. '''
     if prepared is None:
         return cache_size
+
     if prepared.ndim == 3:
         cache[cache_size].copy_(prepared)
         return cache_size + 1
+
     count = prepared.shape[0]
     cache[cache_size:cache_size + count].copy_(prepared)
     return cache_size + count
 
+def store_completed_futures(cache, cache_size, futures, progress):
+    ''' Store completed preparation jobs and update progress. '''
+    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+
+    for future in completed:
+        item_count = futures.pop(future)
+        cache_size = store_prepared(cache, cache_size, future.result())
+        progress.update(item_count)
+
+    return cache_size
+
 def prepare_data(accelerator):
-    ''' Prepare a uint8 training cache with overlapped I/O and preprocessing. '''
+    ''' Prepare a uint8 training cache with ordered I/O and overlapped preprocessing. '''
     if not DATA_DIR.exists():
         return None
 
-    filenames = [filename for filename in os.listdir(DATA_DIR) if filename.lower().endswith(('.jpg', '.png'))]
+    filenames = sorted(filename for filename in os.listdir(DATA_DIR) if filename.lower().endswith(('.jpg', '.jpeg', '.png')))
+    filenames = filenames[:MAX_IMAGES]
     filenames = filenames[accelerator.process_index::accelerator.num_processes]
-    image_limit = MAX_IMAGES // accelerator.num_processes + (accelerator.process_index < MAX_IMAGES % accelerator.num_processes)
-    if len(filenames) > image_limit:
-        selected = set(random.sample(range(len(filenames)), image_limit))
-        filenames = [filename for index, filename in enumerate(filenames) if index in selected]
+
     if not filenames:
         return None
 
-    jpeg_transform = v2.Compose([
-        v2.RandomResizedCrop((256, 256), scale=(0.45, 1.0), ratio=(1.0, 1.0), antialias=True),
-        v2.RandomHorizontalFlip(p=0.5)
-    ])
+    jpeg_transform = v2.CenterCrop((IMAGE_SIZE, IMAGE_SIZE))
     cpu_transform = v2.Compose([
         v2.ToDtype(torch.uint8, scale=True),
-        v2.RandomResizedCrop((256, 256), scale=(0.45, 1.0), ratio=(1.0, 1.0), antialias=True),
-        v2.RandomHorizontalFlip(p=0.5)
+        v2.CenterCrop((IMAGE_SIZE, IMAGE_SIZE))
     ])
-    cache = torch.empty((len(filenames), 3, 256, 256), dtype=torch.uint8)
+    cache = torch.empty((len(filenames), 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8)
     cache_size = 0
     encoded_queue = queue.Queue(maxsize=512)
     reader = threading.Thread(target=read_images, args=(filenames, encoded_queue), daemon=True)
     reader.start()
 
     jpeg_items = []
-    cpu_futures = set()
+    jpeg_futures = {}
+    cpu_futures = {}
     progress = tqdm(total=len(filenames), desc='Preparing images', unit='image', disable=not accelerator.is_main_process)
 
-    with ThreadPoolExecutor(max_workers=4) as cpu_pool:
+    with ThreadPoolExecutor(max_workers=CPU_WORKERS) as cpu_pool, ThreadPoolExecutor(max_workers=1) as jpeg_pool:
         while True:
             item = encoded_queue.get()
             if item is None:
@@ -112,34 +138,36 @@ def prepare_data(accelerator):
                 progress.update(1)
                 continue
 
-            if filename.lower().endswith('.jpg'):
+            if filename.lower().endswith(('.jpg', '.jpeg')):
                 jpeg_items.append(item)
-                if len(jpeg_items) >= 64:
-                    prepared = prepare_jpegs(jpeg_items, jpeg_transform, accelerator.device)
-                    cache_size = store_prepared(cache, cache_size, prepared)
-                    progress.update(len(jpeg_items))
-                    jpeg_items.clear()
+
+                if len(jpeg_items) >= JPEG_BATCH_SIZE:
+                    future = jpeg_pool.submit(prepare_jpegs, jpeg_items, jpeg_transform, accelerator.device)
+                    jpeg_futures[future] = len(jpeg_items)
+                    jpeg_items = []
             else:
-                cpu_futures.add(cpu_pool.submit(prepare_cpu_image, encoded, cpu_transform))
-                if len(cpu_futures) >= 64:
-                    completed, cpu_futures = wait(cpu_futures, return_when=FIRST_COMPLETED)
-                    for future in completed:
-                        cache_size = store_prepared(cache, cache_size, future.result())
-                        progress.update(1)
+                future = cpu_pool.submit(prepare_cpu_image, encoded, cpu_transform)
+                cpu_futures[future] = 1
+
+            if len(cpu_futures) >= MAX_CPU_FUTURES:
+                cache_size = store_completed_futures(cache, cache_size, cpu_futures, progress)
+
+            if len(jpeg_futures) >= MAX_JPEG_FUTURES:
+                cache_size = store_completed_futures(cache, cache_size, jpeg_futures, progress)
 
         if jpeg_items:
-            prepared = prepare_jpegs(jpeg_items, jpeg_transform, accelerator.device)
-            cache_size = store_prepared(cache, cache_size, prepared)
-            progress.update(len(jpeg_items))
+            future = jpeg_pool.submit(prepare_jpegs, jpeg_items, jpeg_transform, accelerator.device)
+            jpeg_futures[future] = len(jpeg_items)
 
         while cpu_futures:
-            completed, cpu_futures = wait(cpu_futures, return_when=FIRST_COMPLETED)
-            for future in completed:
-                cache_size = store_prepared(cache, cache_size, future.result())
-                progress.update(1)
+            cache_size = store_completed_futures(cache, cache_size, cpu_futures, progress)
+
+        while jpeg_futures:
+            cache_size = store_completed_futures(cache, cache_size, jpeg_futures, progress)
 
     reader.join()
     progress.close()
+
     if cache_size == 0:
         return None
 
@@ -177,7 +205,7 @@ def save_checkpoint(model, accelerator):
     os.replace(temporary_path, checkpoint_path)
 
 def main():
-    ''' Train the codec until the configured step limit. '''
+    ''' Train the codec until convergence or the configured step limit. '''
     torch.backends.cudnn.benchmark = True
     ddp_config = DistributedDataParallelKwargs(broadcast_buffers=False, bucket_cap_mb=10, gradient_as_bucket_view=True, static_graph=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_config])
@@ -197,10 +225,14 @@ def main():
     model.train()
     step = 0
     epoch = 1
+    loss_count = 0
+    stop_checks = 0
+    should_stop = False
+    loss_sum = torch.zeros((), device=accelerator.device)
     last_log = time.monotonic()
     last_save = last_log
 
-    while step < MAX_STEPS:
+    while step < MAX_STEPS and not should_stop:
         for batch_number, batch in enumerate(train_loader, 1):
             batch = batch.to(accelerator.device, non_blocking=True).float().mul_(1.0 / 255.0)
             optimizer.zero_grad()
@@ -210,7 +242,25 @@ def main():
             accelerator.backward(loss)
             accelerator.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            loss_sum.add_(loss.detach())
+            loss_count += 1
             step += 1
+
+            if loss_count >= STOP_CHECK_INTERVAL:
+                average_loss = accelerator.reduce(loss_sum / loss_count, reduction='mean')
+                average_loss_value = average_loss.item()
+                loss_sum.zero_()
+                loss_count = 0
+
+                if average_loss_value < STOP_LOSS:
+                    stop_checks += 1
+                else:
+                    stop_checks = 0
+
+                if stop_checks >= STOP_PATIENCE:
+                    should_stop = True
+                    if accelerator.is_main_process:
+                        print(f'Stopping early | average loss {average_loss_value:.4f} below {STOP_LOSS:.4f} for {STOP_PATIENCE} checks')
 
             if accelerator.is_main_process:
                 current_time = time.monotonic()
@@ -223,7 +273,7 @@ def main():
                         save_checkpoint(model, accelerator)
                         last_save = current_time
 
-            if step >= MAX_STEPS:
+            if step >= MAX_STEPS or should_stop:
                 break
 
         epoch += 1
