@@ -80,6 +80,7 @@ def main():
     model.train()
     step = 0
     last_log = time.monotonic()
+    last_save = last_log
 
     while step < MAX_STEPS:
         for batch in train_loader:
@@ -91,13 +92,18 @@ def main():
             optimizer.step()
             step += 1
 
-            if accelerator.is_main_process and time.monotonic() - last_log >= 20:
-                psnr = -10.0 * math.log10(max(mse.item(), 1e-12))
-                print(f'step {step:7d} | loss {loss.item():.4f} | bpp {bpp.item():.4f} | psnr {psnr:.2f} dB')
-                last_log = time.monotonic()
+            current_time = time.monotonic()
 
-            if step % 500 == 0:
-                save_checkpoint(model, accelerator)
+            if current_time - last_log >= 20:
+                if accelerator.is_main_process:
+                    psnr = -10.0 * math.log10(max(mse.item(), 1e-12))
+                    print(f'step {step:7d} | loss {loss.item():.4f} | bpp {bpp.item():.4f} | psnr {psnr:.2f} dB')
+
+                last_log = current_time
+
+                if current_time - last_save >= 300:
+                    save_checkpoint(model, accelerator)
+                    last_save = current_time
 
             if step >= MAX_STEPS:
                 break
