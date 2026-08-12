@@ -1,13 +1,14 @@
 ''' Train the neural image codec. '''
 
-import math, os, random, time
+import math, os, queue, random, threading, time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import torch, torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from torch.utils.data import DataLoader
-from torchvision.io import decode_image
+from torchvision.io import decode_image, decode_jpeg, read_file
 from torchvision.transforms import v2
 from tqdm import tqdm
 
@@ -21,35 +22,124 @@ MAX_STEPS = 15000
 MAX_IMAGES = 20000
 BATCH_SIZE = 32
 
+def read_images(filenames, encoded_queue):
+    ''' Continuously read encoded image files into the preparation queue. '''
+    for filename in filenames:
+        try:
+            encoded = read_file(DATA_DIR / filename)
+        except (OSError, RuntimeError):
+            encoded = None
+        encoded_queue.put((filename, encoded))
+    encoded_queue.put(None)
+
+def prepare_cpu_image(encoded, transform):
+    ''' Decode and prepare one non-JPEG image on the CPU. '''
+    try:
+        return transform(decode_image(encoded, mode='RGB'))
+    except RuntimeError:
+        return None
+
+def prepare_jpegs(items, transform, device):
+    ''' Decode and prepare a JPEG batch on the local GPU. '''
+    encoded = [item[1] for item in items]
+    try:
+        images = decode_jpeg(encoded, mode='RGB', device=device)
+        return torch.stack([transform(image) for image in images]).cpu()
+    except RuntimeError:
+        prepared = []
+        for image_data in encoded:
+            try:
+                image = decode_jpeg(image_data, mode='RGB', device=device)
+                prepared.append(transform(image))
+            except RuntimeError:
+                continue
+        if not prepared:
+            return None
+        return torch.stack(prepared).cpu()
+
+def store_prepared(cache, cache_size, prepared):
+    ''' Copy prepared images into the contiguous RAM cache. '''
+    if prepared is None:
+        return cache_size
+    if prepared.ndim == 3:
+        cache[cache_size].copy_(prepared)
+        return cache_size + 1
+    count = prepared.shape[0]
+    cache[cache_size:cache_size + count].copy_(prepared)
+    return cache_size + count
+
 def prepare_data(accelerator):
-    ''' Prepare a uint8 training cache in system memory. '''
+    ''' Prepare a uint8 training cache with overlapped I/O and preprocessing. '''
     if not DATA_DIR.exists():
         return None
 
-    filenames = sorted(filename for filename in os.listdir(DATA_DIR) if filename.lower().endswith(('.jpg', '.png')))
+    filenames = [filename for filename in os.listdir(DATA_DIR) if filename.lower().endswith(('.jpg', '.png'))]
     filenames = filenames[accelerator.process_index::accelerator.num_processes]
     image_limit = MAX_IMAGES // accelerator.num_processes + (accelerator.process_index < MAX_IMAGES % accelerator.num_processes)
     if len(filenames) > image_limit:
-        filenames = random.sample(filenames, image_limit)
+        selected = set(random.sample(range(len(filenames)), image_limit))
+        filenames = [filename for index, filename in enumerate(filenames) if index in selected]
     if not filenames:
         return None
 
-    transform = v2.Compose([
+    jpeg_transform = v2.Compose([
+        v2.RandomResizedCrop((256, 256), scale=(0.45, 1.0), ratio=(1.0, 1.0), antialias=True),
+        v2.RandomHorizontalFlip(p=0.5)
+    ])
+    cpu_transform = v2.Compose([
         v2.ToDtype(torch.uint8, scale=True),
         v2.RandomResizedCrop((256, 256), scale=(0.45, 1.0), ratio=(1.0, 1.0), antialias=True),
         v2.RandomHorizontalFlip(p=0.5)
     ])
     cache = torch.empty((len(filenames), 3, 256, 256), dtype=torch.uint8)
     cache_size = 0
+    encoded_queue = queue.Queue(maxsize=512)
+    reader = threading.Thread(target=read_images, args=(filenames, encoded_queue), daemon=True)
+    reader.start()
 
-    for filename in tqdm(filenames, desc='Preparing images', unit='image', disable=not accelerator.is_main_process):
-        try:
-            image = decode_image(str(DATA_DIR / filename), mode='RGB')
-            cache[cache_size].copy_(transform(image))
-            cache_size += 1
-        except RuntimeError:
-            continue
+    jpeg_items = []
+    cpu_futures = set()
+    progress = tqdm(total=len(filenames), desc='Preparing images', unit='image', disable=not accelerator.is_main_process)
 
+    with ThreadPoolExecutor(max_workers=4) as cpu_pool:
+        while True:
+            item = encoded_queue.get()
+            if item is None:
+                break
+
+            filename, encoded = item
+            if encoded is None:
+                progress.update(1)
+                continue
+
+            if filename.lower().endswith('.jpg'):
+                jpeg_items.append(item)
+                if len(jpeg_items) >= 64:
+                    prepared = prepare_jpegs(jpeg_items, jpeg_transform, accelerator.device)
+                    cache_size = store_prepared(cache, cache_size, prepared)
+                    progress.update(len(jpeg_items))
+                    jpeg_items.clear()
+            else:
+                cpu_futures.add(cpu_pool.submit(prepare_cpu_image, encoded, cpu_transform))
+                if len(cpu_futures) >= 64:
+                    completed, cpu_futures = wait(cpu_futures, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        cache_size = store_prepared(cache, cache_size, future.result())
+                        progress.update(1)
+
+        if jpeg_items:
+            prepared = prepare_jpegs(jpeg_items, jpeg_transform, accelerator.device)
+            cache_size = store_prepared(cache, cache_size, prepared)
+            progress.update(len(jpeg_items))
+
+        while cpu_futures:
+            completed, cpu_futures = wait(cpu_futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                cache_size = store_prepared(cache, cache_size, future.result())
+                progress.update(1)
+
+    reader.join()
+    progress.close()
     if cache_size == 0:
         return None
 
