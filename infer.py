@@ -39,7 +39,7 @@ def load_model(checkpoint_path):
 
     model = ImageCodec()
     model.load_state_dict(torch.load(checkpoint_path, map_location='cpu', weights_only=True))
-    model.update(force=True)
+    model.update(force=True, update_quantiles=True)
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model.eval().to(device)
 
@@ -99,7 +99,9 @@ class CodecGUI:
 
         self.model = None
         self.model_id = None
-        self.checkpoint_var = tk.StringVar(value='checkpoints/latest.pt')
+        checkpoints = list(Path('checkpoints').glob('checkpoint_*.pt'))
+        checkpoint_path = str(max(checkpoints, key=lambda path: path.stat().st_mtime)) if checkpoints else ''
+        self.checkpoint_var = tk.StringVar(value=checkpoint_path)
         self.status_var = tk.StringVar(value='Load a trained checkpoint first.')
 
         tk.Label(root, text='Checkpoint').pack(anchor='w', padx=18, pady=(18, 4))

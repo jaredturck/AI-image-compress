@@ -43,21 +43,21 @@ class ImageCodec(CompressionModel):
     def forward(self, image):
         ''' Run the differentiable training path. '''
         latent = self.encoder(image)
+        hyper_latent = self.hyper_encoder(torch.abs(latent))
 
         with torch.autocast(device_type=image.device.type, enabled=False):
-            latent = latent.float()
-            hyper_latent = self.hyper_encoder(torch.abs(latent))
-            hyper_latent_hat, hyper_likelihoods = self.entropy_bottleneck(hyper_latent)
-            scales = self.hyper_decoder(hyper_latent_hat)
-            latent_hat, latent_likelihoods = self.gaussian_conditional(latent, scales)
+            hyper_latent_hat, hyper_likelihoods = self.entropy_bottleneck(hyper_latent.float())
+
+        scales = self.hyper_decoder(hyper_latent_hat)
+
+        with torch.autocast(device_type=image.device.type, enabled=False):
+            latent_hat, latent_likelihoods = self.gaussian_conditional(latent.float(), scales.float())
             pixels = image.shape[0] * image.shape[2] * image.shape[3]
-            latent_bits = -torch.log2(latent_likelihoods).sum()
-            hyper_bits = -torch.log2(hyper_likelihoods).sum()
-            bpp = (latent_bits + hyper_bits) / pixels
+            bpp = -(torch.log2(latent_likelihoods).sum() + torch.log2(hyper_likelihoods).sum()) / pixels
 
         return self.decoder(latent_hat), bpp
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def compress(self, image):
         ''' Compress one image tensor into entropy-coded byte strings. '''
         latent = self.encoder(image)
@@ -69,7 +69,7 @@ class ImageCodec(CompressionModel):
         latent_strings = self.gaussian_conditional.compress(latent, indexes)
         return latent_strings[0], hyper_strings[0]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def decompress(self, latent_stream, hyper_stream, shape):
         ''' Reconstruct one image tensor from entropy-coded byte strings. '''
         hyper_latent_hat = self.entropy_bottleneck.decompress([hyper_stream], shape)
