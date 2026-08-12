@@ -1,6 +1,6 @@
 ''' Neural image compression model. '''
 
-import torch, torch.nn as nn, torch.nn.functional as F
+import torch, torch.nn as nn
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.layers import GDN
 from compressai.models import CompressionModel
@@ -37,6 +37,7 @@ class ImageCodec(CompressionModel):
             nn.Conv2d(CHANNELS, LATENT_CHANNELS, 3, padding=1), nn.ReLU(inplace=True)
         )
         self.entropy_bottleneck = EntropyBottleneck(CHANNELS)
+        self.entropy_bottleneck.quantiles.requires_grad_(False)
         self.gaussian_conditional = GaussianConditional(None)
 
     def forward(self, image):
@@ -54,9 +55,7 @@ class ImageCodec(CompressionModel):
             hyper_bits = -torch.log2(hyper_likelihoods).sum()
             bpp = (latent_bits + hyper_bits) / pixels
 
-        reconstruction = self.decoder(latent_hat)
-        mse = F.mse_loss(reconstruction.float(), image.float())
-        return reconstruction, bpp, mse
+        return self.decoder(latent_hat), bpp
 
     @torch.no_grad()
     def compress(self, image):

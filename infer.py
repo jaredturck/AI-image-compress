@@ -138,7 +138,7 @@ class CodecGUI:
 
     def compress(self):
         ''' Choose an image and compress it. '''
-        input_path = filedialog.askopenfilename(filetypes=[('Images', '*.jpg *.jpeg *.png *.webp'), ('All files', '*')])
+        input_path = filedialog.askopenfilename(filetypes=[('Images', '*.jpg *.png'), ('All files', '*')])
         if not input_path:
             return
 
