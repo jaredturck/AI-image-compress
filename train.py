@@ -12,7 +12,7 @@ from torchvision.transforms import v2
 
 from model import ImageCodec
 
-DATA_DIR = Path('/path/to/your/images')
+DATA_DIR = Path('/mnt/8TB_HDD/datasets/anime_dataset/train/')
 CHECKPOINT_DIR = Path('checkpoints')
 LEARNING_RATE = 1e-4
 LAMBDA = 0.010
