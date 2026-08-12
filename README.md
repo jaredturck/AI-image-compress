@@ -1,73 +1,91 @@
 # Neural Image Codec
 
-A from-scratch learned image compression experiment built around PyTorch. The learned architecture is defined directly in `model.py`; there are no imported pretrained models, codec networks, entropy-model packages, or CompressAI components.
+A small learned image-compression experiment built around a custom convolutional autoencoder and the scale-hyperprior design from Ballé et al. (ICLR 2018).
 
-The only non-PyTorch training dependency is Hugging Face Accelerate for two-GPU data-parallel training. Attention inside the image transform uses PyTorch's fused FlashAttention SDPA backend on CUDA BF16/FP16 tensors. Attention is applied in fixed 16x16 spatial windows so inference cost remains reasonable on images larger than the 256x256 training crop.
+The project deliberately keeps the learned image transforms in this repository while using CompressAI for standard compression plumbing: GDN, entropy models, CDF construction, and rANS coding. No pretrained or ready-made autoencoder is imported.
 
-## What the codec actually stores
+## Core pipeline
 
-The encoder does **not** dump floating-point latents to disk.
+```text
+image
+  -> convolutional encoder
+  -> main latent y
+  -> quantization + entropy coding
+  -> .nic file
+  -> entropy decoding
+  -> convolutional decoder
+  -> reconstructed image
+```
 
-1. The image encoder produces a main latent tensor `y` at 1/16 spatial resolution.
-2. A small hyper-encoder produces `z` at 1/64 spatial resolution.
-3. `z` is rounded to integers and entropy-coded first.
-4. Decoded `z` predicts image-specific mean/scale statistics for `y`.
-5. `y` is encoded in uneven channel groups: `16, 16, 32, 64, 128`.
-6. Previously encoded integer residual groups feed a small context network, improving the probability estimates for later groups.
-7. Each integer symbol is range-coded using a Gaussian CDF selected from 64 logarithmically spaced scale levels.
-8. Training explicitly minimizes estimated bitrate plus reconstruction distortion.
+A small hyperprior provides side information used to predict the probability scale of each `y` value:
 
-The `.nic` file contains only a small header plus the range-coded `z` and `y` streams. The exact trained checkpoint is the decoder/codebook and is intentionally not duplicated inside each image file.
+```text
+                         -> hyper encoder -> z -> entropy bottleneck -> z_hat
+                        /                                      |
+image -> encoder -> y --                                       v
+                        \-------------------------- hyper decoder
+                                                         |
+                                                    scales for y
+                                                         |
+                                                Gaussian conditional
+```
+
+This keeps the useful 2018 hyperprior while removing the later attention, residual-stack, autoregressive context, and uneven channel-group machinery.
 
 ## Architecture
 
-Approximately **60.87M parameters** total.
-
-### Main encoder
+### Encoder
 
 ```text
-RGB 256x256
-  -> Conv 3->128, stride 2 + GDN + ResBlock
-  -> Conv 128->192, stride 2 + GDN + 2 ResBlocks
-  -> Conv 192->256, stride 2 + GDN + 3 ResBlocks + windowed FlashAttention
-  -> Conv 256->320, stride 2 + GDN + 6 ResBlocks + windowed FlashAttention
-  -> Conv 320->256
-  -> y: 256x16x16
+RGB
+  -> Conv 3 -> 128, stride 2 + GDN
+  -> Conv 128 -> 128, stride 2 + GDN
+  -> Conv 128 -> 128, stride 2 + GDN
+  -> Conv 128 -> 192, stride 2
+  -> y
+```
+
+### Decoder
+
+```text
+y_hat
+  -> ConvTranspose 192 -> 128, stride 2 + IGDN
+  -> ConvTranspose 128 -> 128, stride 2 + IGDN
+  -> ConvTranspose 128 -> 128, stride 2 + IGDN
+  -> ConvTranspose 128 -> 3, stride 2
+  -> reconstructed RGB
 ```
 
 ### Hyperprior
 
 ```text
 abs(y)
-  -> Conv 256->192
-  -> Conv 192->160, stride 2
-  -> Conv 160->128, stride 2
-  -> z: 128x4x4
+  -> Conv 192 -> 128
+  -> Conv 128 -> 128, stride 2
+  -> Conv 128 -> 128, stride 2
+  -> z
 
-z
-  -> upsample + Conv 128->160
-  -> upsample + Conv 160->192
-  -> Conv 192->512
-  -> per-location mean and scale for y
+z_hat
+  -> ConvTranspose 128 -> 128, stride 2
+  -> ConvTranspose 128 -> 128, stride 2
+  -> Conv 128 -> 192
+  -> scales for y
 ```
 
-### Channel context
+`z` is entropy-coded with `EntropyBottleneck`. The decoded `z_hat` predicts scales for `GaussianConditional`, which entropy-codes `y`.
 
-A transparent three-convolution PyTorch network reads already encoded integer residual groups and predicts corrections to the mean/scale estimates for later groups.
+## What CompressAI is used for
 
-### Main decoder
+Only standard learned-compression components are imported:
 
 ```text
-y_hat: 256x16x16
-  -> Conv 256->320 + windowed FlashAttention + 12 ResBlocks
-  -> upsample + Conv 320->256 + IGDN + 3 ResBlocks + windowed FlashAttention
-  -> upsample + Conv 256->192 + IGDN + 2 ResBlocks
-  -> upsample + Conv 192->128 + IGDN + ResBlock
-  -> upsample + Conv 128->64 + IGDN + ResBlock
-  -> Conv 64->3 + sigmoid
+compressai.layers.GDN
+compressai.entropy_models.EntropyBottleneck
+compressai.entropy_models.GaussianConditional
+compressai.models.CompressionModel
 ```
 
-The large number of low-resolution residual blocks gives the decoder useful capacity without paying for that depth at full image resolution.
+The encoder, decoder, hyper encoder, and hyper decoder are defined directly in `model.py` using PyTorch convolutional layers.
 
 ## Training objective
 
@@ -75,26 +93,29 @@ The large number of low-resolution residual blocks gives the decoder useful capa
 loss = estimated_bpp + lambda * 255^2 * MSE
 ```
 
-`estimated_bpp` is computed from the same quantized Gaussian probability model used by the real arithmetic coder. Quantization uses uniform `[-0.5, 0.5]` noise during training and integer rounding during compression.
+The main optimizer trains the transforms and entropy-model parameters. CompressAI's entropy bottleneck also has a small auxiliary loss for its quantile parameters, trained with a separate auxiliary optimizer.
 
-## Image preparation
+## `.nic` files
 
-`data.py` recursively finds JPG/JPEG/PNG/WEBP files and uses TorchVision only:
+The current format is `NIC2` and contains:
 
 ```text
-decode_image(..., mode="RGB")
-  -> RandomResizedCrop(256x256, square crop, antialias=True)
-  -> RandomHorizontalFlip
-  -> float32 scaled to [0, 1]
+header
+  magic/version
+  checkpoint identifier
+  original width/height
+  hyper-latent shape
+  y/z stream lengths
+
+compressed y stream
+compressed z stream
 ```
 
-No ImageNet mean/std normalization is used because the model reconstructs RGB values directly.
+The checkpoint itself is not stored in every image. A 16-byte SHA-256 checkpoint identifier ensures a `.nic` file is decoded with the same learned model that created it.
 
-Validation uses aspect-preserving resize, center crop, and `[0, 1]` conversion.
+`NIC2` is intentionally incompatible with the previous experimental `NIC1` format.
 
 ## Setup
-
-Create an environment and install the dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -104,18 +125,12 @@ On Arch Linux, Tkinter normally comes from the `tk` package if it is not already
 
 Edit `DATA_DIR` in `config.py` so it points at your image folder.
 
-## Train on both RTX 3090s
+## Training
 
-The included Accelerate config is set for two local GPUs and BF16:
+The included Accelerate configuration uses two GPUs and BF16:
 
 ```bash
 accelerate launch --config_file accelerate_config.yaml train.py
-```
-
-Equivalent explicit launch:
-
-```bash
-accelerate launch --multi_gpu --mixed_precision=bf16 --num_processes=2 train.py
 ```
 
 Checkpoints are written to:
@@ -124,18 +139,11 @@ Checkpoints are written to:
 checkpoints/latest.pt
 ```
 
-Reconstruction previews are written to `checkpoints/previews/`. Each preview places original images first and reconstructions second.
-
-The main knobs are all in `config.py`, especially:
+Reconstruction previews are written to:
 
 ```text
-BATCH_SIZE
-LEARNING_RATE
-LAMBDA
-MAX_STEPS
+checkpoints/previews/
 ```
-
-For two 24 GB RTX 3090s, the starting per-process batch size is 8. Reduce it if your particular PyTorch/CUDA build runs out of memory.
 
 ## GUI
 
@@ -145,25 +153,7 @@ After training:
 python gui.py
 ```
 
-1. Load `checkpoints/latest.pt`.
-2. Choose **Compress image** and save a `.nic` file.
-3. Choose **Decompress .nic** and save the reconstructed PNG.
-
-The GUI reports the actual compressed byte count and bits per pixel.
-
-A `.nic` file is tied to the exact checkpoint that created it. A 16-byte SHA-256 checkpoint identifier is stored in the file header so the GUI refuses to decode with the wrong network weights.
-
-## Programmatic inference
-
-`infer.py` exposes:
-
-```text
-load_model(...)
-compress_image(...)
-decompress_image(...)
-```
-
-The codec pads arbitrary input dimensions to a multiple of 64 for the network, stores the original dimensions in the header, and removes the padding after decompression. The main encoder/decoder run on the selected GPU; the small entropy/hyper/context path and arithmetic coder run in deterministic float32 on CPU so the bitstream does not depend on BF16 FlashAttention numerics.
+Load the checkpoint, compress an image to `.nic`, or decompress a `.nic` file back to PNG.
 
 ## Smoke test
 
@@ -171,30 +161,28 @@ The codec pads arbitrary input dimensions to a multiple of 64 for the network, s
 python smoke_test.py
 ```
 
-This uses a randomly initialized network and verifies the full latent entropy-code/decode path. It does not test image quality; useful reconstructions require training.
+The smoke test uses a randomly initialized model to exercise CompressAI's real entropy encode/decode path. It checks plumbing only; image quality requires training.
 
 ## Project files
 
 ```text
-model.py                 neural architecture, quantization, rate estimate
-codec.py                 arithmetic coder, Gaussian CDFs, .nic bitstream
-data.py                  image discovery and TorchVision preprocessing
+model.py                 custom convolutional codec + scale hyperprior
+codec.py                 small NIC2 file container
 config.py                training settings
-train.py                 Accelerate two-GPU training loop
-infer.py                 compression/decompression API
+data.py                  image dataset and preprocessing
+train.py                 Accelerate training loop
+infer.py                 checkpoint loading and image compression API
 gui.py                   minimal Tk GUI
-smoke_test.py            end-to-end codec sanity check
+smoke_test.py            entropy-code/decode sanity check
 accelerate_config.yaml   two-GPU BF16 launcher config
 requirements.txt         dependencies
 ```
 
 ## Research basis
 
-The design intentionally uses a small subset of ideas that materially affect file size while remaining understandable from the source:
+The baseline intentionally follows the simpler branch of learned image compression:
 
-- Ballé et al., *Variational Image Compression with a Scale Hyperprior* — side information/hyperprior and rate-distortion training.
-- Minnen et al., *Joint Autoregressive and Hierarchical Priors for Learned Image Compression* — learned conditional entropy models.
-- He et al., *ELIC* — uneven channel grouping and practical context modelling.
-- Dao et al., *FlashAttention / FlashAttention-2* — fused exact attention; this project reaches it through PyTorch SDPA rather than importing a transformer model.
+- Ballé, Laparra, Simoncelli — *End-to-end Optimized Image Compression* (ICLR 2017): convolutional analysis/synthesis transforms, GDN, differentiable quantization, and rate-distortion training.
+- Ballé, Minnen, Singh, Hwang, Johnston — *Variational Image Compression with a Scale Hyperprior* (ICLR 2018): the `z` hyperprior and conditional scale model used here.
 
-The project deliberately does not implement a pixel-by-pixel autoregressive context model: that can improve rate-distortion performance but makes decoding serial and much slower. The channel-group context is the compromise used here.
+Later ideas such as autoregressive context models, uneven channel groups, deep residual transforms, and attention are intentionally not part of this baseline.

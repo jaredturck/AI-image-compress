@@ -1,5 +1,4 @@
 import math
-from pathlib import Path
 
 import torch
 from accelerate import Accelerator
@@ -80,13 +79,19 @@ def main():
         return
 
     model = ImageCodec()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
-    model, optimizer, train_loader, validation_loader = accelerator.prepare(
+    main_parameters = [parameter for name, parameter in model.named_parameters() if not name.endswith(".quantiles")]
+    aux_parameters = [parameter for name, parameter in model.named_parameters() if name.endswith(".quantiles")]
+    optimizer = torch.optim.Adam(main_parameters, lr=config.LEARNING_RATE)
+    aux_optimizer = torch.optim.Adam(aux_parameters, lr=config.AUX_LEARNING_RATE)
+
+    model, optimizer, aux_optimizer, train_loader, validation_loader = accelerator.prepare(
         model,
         optimizer,
+        aux_optimizer,
         train_loader,
         validation_loader,
     )
+    optimizer_parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
 
     if accelerator.is_main_process:
         parameters = count_parameters(accelerator.unwrap_model(model))
@@ -104,8 +109,13 @@ def main():
             reconstruction, bpp, mse = model(images)
             loss = bpp + config.LAMBDA * (255.0 ** 2) * mse
             accelerator.backward(loss)
-            accelerator.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
+            accelerator.clip_grad_norm_(optimizer_parameters, config.GRAD_CLIP)
             optimizer.step()
+
+            aux_optimizer.zero_grad(set_to_none=True)
+            aux_loss = accelerator.unwrap_model(model).aux_loss()
+            accelerator.backward(aux_loss)
+            aux_optimizer.step()
             step += 1
 
             if step % config.LOG_EVERY == 0:
