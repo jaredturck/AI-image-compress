@@ -1,12 +1,12 @@
 ''' Train the neural image codec. '''
 
-import math, os, time
+import math, os, random, time
 from pathlib import Path
 
 import torch, torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs
-from torch.utils.data import DataLoader, Dataset
+from accelerate.utils import DistributedDataParallelKwargs
+from torch.utils.data import DataLoader
 from torchvision.io import decode_image
 from torchvision.transforms import v2
 
@@ -17,32 +17,20 @@ CHECKPOINT_DIR = Path('checkpoints')
 LEARNING_RATE = 1e-4
 LAMBDA = 0.010
 MAX_STEPS = 15000
+MAX_IMAGES = 20000
 BATCH_SIZE = 32
 
-class ImageDataset(Dataset):
-    ''' Load and transform training images. '''
-
-    def __init__(self, paths, transform):
-        ''' Store image paths and the training transform. '''
-        self.paths = paths
-        self.transform = transform
-
-    def __len__(self):
-        ''' Return the number of training images. '''
-        return len(self.paths)
-
-    def __getitem__(self, index):
-        ''' Load and transform one training image. '''
-        image = decode_image(str(self.paths[index]), mode='RGB')
-        return self.transform(image)
-
-def prepare_data():
-    ''' Prepare the training image loader. '''
+def prepare_data(accelerator):
+    ''' Prepare a uint8 training cache in system memory. '''
     if not DATA_DIR.exists():
         return None
 
-    image_paths = [DATA_DIR / filename for filename in os.listdir(DATA_DIR) if filename.lower().endswith(('.jpg', '.png'))]
-    if not image_paths:
+    filenames = sorted(filename for filename in os.listdir(DATA_DIR) if filename.lower().endswith(('.jpg', '.png')))
+    filenames = filenames[accelerator.process_index::accelerator.num_processes]
+    image_limit = MAX_IMAGES // accelerator.num_processes + (accelerator.process_index < MAX_IMAGES % accelerator.num_processes)
+    if len(filenames) > image_limit:
+        filenames = random.sample(filenames, image_limit)
+    if not filenames:
         return None
 
     transform = v2.Compose([
@@ -50,9 +38,23 @@ def prepare_data():
         v2.RandomResizedCrop((256, 256), scale=(0.45, 1.0), ratio=(1.0, 1.0), antialias=True),
         v2.RandomHorizontalFlip(p=0.5)
     ])
-    dataset = ImageDataset(image_paths, transform)
-    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=6, pin_memory=True, persistent_workers=True,
-        prefetch_factor=4)
+    cache = torch.empty((len(filenames), 3, 256, 256), dtype=torch.uint8)
+    cache_size = 0
+
+    for filename in filenames:
+        try:
+            image = decode_image(str(DATA_DIR / filename), mode='RGB')
+            cache[cache_size].copy_(transform(image))
+            cache_size += 1
+        except RuntimeError:
+            continue
+
+    if cache_size == 0:
+        return None
+
+    cache = cache[:cache_size]
+    return DataLoader(cache, batch_size=BATCH_SIZE, shuffle=True, num_workers=6, pin_memory=True, persistent_workers=True,
+        prefetch_factor=4, drop_last=True)
 
 def save_checkpoint(model, accelerator):
     ''' Save a checkpoint in a three-file rolling window. '''
@@ -76,16 +78,15 @@ def save_checkpoint(model, accelerator):
 def main():
     ''' Train the codec until the configured step limit. '''
     torch.backends.cudnn.benchmark = True
-    dataloader_config = DataLoaderConfiguration(non_blocking=True)
     ddp_config = DistributedDataParallelKwargs(broadcast_buffers=False, bucket_cap_mb=10, gradient_as_bucket_view=True, static_graph=True)
-    accelerator = Accelerator(dataloader_config=dataloader_config, kwargs_handlers=[ddp_config])
-    train_loader = prepare_data()
+    accelerator = Accelerator(kwargs_handlers=[ddp_config])
+    train_loader = prepare_data(accelerator)
     if train_loader is None:
         return
 
     model = ImageCodec()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, fused=True)
-    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    model, optimizer = accelerator.prepare(model, optimizer)
 
     if accelerator.is_main_process:
         print(f'Training started | batch size {BATCH_SIZE} | {MAX_STEPS:,} batches')
@@ -97,7 +98,7 @@ def main():
 
     while step < MAX_STEPS:
         for batch in train_loader:
-            batch = batch.float().mul_(1.0 / 255.0)
+            batch = batch.to(accelerator.device, non_blocking=True).float().mul_(1.0 / 255.0)
             optimizer.zero_grad()
             reconstruction, bpp = model(batch)
             mse = F.mse_loss(reconstruction, batch)
