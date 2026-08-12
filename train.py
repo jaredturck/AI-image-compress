@@ -11,21 +11,26 @@ from torch.utils.data import DataLoader
 from torchvision.io import decode_image, decode_jpeg, read_file
 from torchvision.transforms import v2
 from tqdm import tqdm
-from model import ImageCodec
+from model import ImageCodec, PatchDiscriminator, extract_texture
 
 # accelerate launch --multi_gpu --num_processes 2 --mixed_precision bf16 train.py
 
 DATA_DIR = Path('/mnt/8TB_HDD/datasets/anime_dataset/train/')
 CHECKPOINT_DIR = Path('checkpoints')
 LEARNING_RATE = 1e-4
+DISCRIMINATOR_LEARNING_RATE = 1e-4
 LAMBDA = 0.010
+DETAIL_LOSS_WEIGHT = 2.0
+VQ_LOSS_WEIGHT = 0.25
+ADVERSARIAL_LOSS_WEIGHT = 0.05
+GAN_START_STEP = 500
 MAX_STEPS = 15000
 MAX_IMAGES = 100_000
 BATCH_SIZE = 128
 STOP_CHECK_INTERVAL = 25
 STOP_MIN_DELTA = 0.01
 STOP_PATIENCE = 5
-STOP_MIN_STEPS = 500
+STOP_MIN_STEPS = 1000
 IMAGE_SIZE = 256
 JPEG_BATCH_SIZE = 64
 MAX_JPEG_FUTURES = 4
@@ -231,15 +236,19 @@ def main():
     dataset_images = int(accelerator.reduce(dataset_images, reduction='sum').item())
 
     model = ImageCodec()
+    discriminator = PatchDiscriminator()
     checkpoint_path = load_checkpoint(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, fused=True)
-    model, optimizer = accelerator.prepare(model, optimizer)
+    discriminator_optimizer = torch.optim.Adam(discriminator.parameters(), lr=DISCRIMINATOR_LEARNING_RATE, betas=(0.0, 0.99), fused=True)
+    model, discriminator, optimizer, discriminator_optimizer = accelerator.prepare(model, discriminator, optimizer, discriminator_optimizer)
+    discriminator_model = accelerator.unwrap_model(discriminator)
 
     if accelerator.is_main_process:
         weights = checkpoint_path.name if checkpoint_path else 'random'
         print(f'Training started | batch size {BATCH_SIZE} | weights {weights}')
 
     model.train()
+    discriminator.train()
     step = 0
     epoch = 1
     loss_count = 0
@@ -254,14 +263,31 @@ def main():
     while step < MAX_STEPS and not should_stop:
         for batch_number, batch in enumerate(train_loader, 1):
             batch = batch.to(accelerator.device, non_blocking=True).float().mul_(1.0 / 255.0)
-            optimizer.zero_grad()
-            reconstruction, bpp = model(batch)
+            optimizer.zero_grad(set_to_none=True)
+            reconstruction, structure_bpp, texture_bpp, vq_loss, texture_target = model(batch)
             mse = F.mse_loss(reconstruction, batch)
-            loss = bpp + LAMBDA * (255.0 ** 2) * mse
+            detail_loss = F.l1_loss(extract_texture(reconstruction), texture_target)
+            adversarial_loss = torch.zeros((), device=accelerator.device)
+
+            if step >= GAN_START_STEP:
+                discriminator_optimizer.zero_grad(set_to_none=True)
+                real_logits = discriminator(batch)
+                fake_logits = discriminator(reconstruction.detach())
+                discriminator_loss = 0.5 * (F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean())
+                accelerator.backward(discriminator_loss)
+                accelerator.clip_grad_norm_(discriminator.parameters(), 1.0)
+                discriminator_optimizer.step()
+
+                discriminator_model.requires_grad_(False)
+                adversarial_loss = -discriminator_model(reconstruction).mean()
+                discriminator_model.requires_grad_(True)
+
+            monitor_loss = structure_bpp + texture_bpp + LAMBDA * (255.0 ** 2) * mse + DETAIL_LOSS_WEIGHT * detail_loss + VQ_LOSS_WEIGHT * vq_loss
+            loss = monitor_loss + ADVERSARIAL_LOSS_WEIGHT * adversarial_loss
             accelerator.backward(loss)
             accelerator.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            loss_sum.add_(loss.detach())
+            loss_sum.add_(monitor_loss.detach())
             loss_count += 1
             step += 1
 

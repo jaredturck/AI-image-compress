@@ -1,6 +1,6 @@
 ''' Compress and reconstruct images with a trained codec. '''
 
-import hashlib, shutil, struct, subprocess, tkinter as tk
+import hashlib, io, shutil, struct, subprocess, tkinter as tk, zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog
@@ -17,8 +17,8 @@ from model import ImageCodec
 PROJECT_DIR = Path(__file__).resolve().parent
 CHECKPOINT_DIR = PROJECT_DIR / 'checkpoints'
 COMPRESSED_DIR = PROJECT_DIR / 'compressed_images'
-MAGIC = b'NIC3'
-HEADER = struct.Struct('<4s16sIII')
+MAGIC = b'NIC4'
+HEADER = struct.Struct('<4s16sIIIII')
 PREVIEW_PADDING = 24
 PREVIEW_RESIZE_DELAY = 50
 PREVIEW_ZOOM_STEP = 1.2
@@ -31,18 +31,106 @@ def read_file(path):
     if len(data) < HEADER.size:
         return None
 
-    magic, model_id, width, height, latent_size = HEADER.unpack_from(data)
-    if magic != MAGIC or latent_size > len(data) - HEADER.size:
+    magic, model_id, width, height, latent_size, hyper_size, texture_size = HEADER.unpack_from(data)
+    payload_size = latent_size + hyper_size + texture_size
+    if magic != MAGIC or payload_size != len(data) - HEADER.size:
         return None
 
-    offset = HEADER.size
+    latent_offset = HEADER.size
+    hyper_offset = latent_offset + latent_size
+    texture_offset = hyper_offset + hyper_size
     return {
         'model_id': model_id,
         'width': width,
         'height': height,
-        'latent_stream': data[offset:offset + latent_size],
-        'hyper_stream': data[offset + latent_size:],
+        'latent_stream': data[latent_offset:hyper_offset],
+        'hyper_stream': data[hyper_offset:texture_offset],
+        'texture_stream': data[texture_offset:],
     }
+
+def pack_texture_tokens(texture_mask, texture_indices):
+    ''' Store a sparse texture mask and one-byte VQ indices with optional zlib compression. '''
+    mask = texture_mask.detach().to(torch.uint8).cpu().numpy().reshape(-1)
+    packed_mask = np.packbits(mask, bitorder='little').tobytes()
+    raw_indices = texture_indices.detach().to(torch.uint8).cpu().numpy().tobytes()
+    raw_texture = packed_mask + raw_indices
+    compressed_texture = zlib.compress(raw_texture, level=9)
+    if len(compressed_texture) < len(raw_texture):
+        return b'\x01' + compressed_texture
+    return b'\x00' + raw_texture
+
+def unpack_texture_tokens(texture_stream, width, height):
+    ''' Restore the sparse H/8 texture mask and selected VQ indices. '''
+    if not texture_stream:
+        return None
+
+    padded_width = ((width + 63) // 64) * 64
+    padded_height = ((height + 63) // 64) * 64
+    token_width = padded_width // 8
+    token_height = padded_height // 8
+    token_count = token_width * token_height
+    mask_size = (token_count + 7) // 8
+
+    if texture_stream[0] == 1:
+        raw_texture = zlib.decompress(texture_stream[1:])
+    elif texture_stream[0] == 0:
+        raw_texture = texture_stream[1:]
+    else:
+        return None
+
+    if len(raw_texture) < mask_size:
+        return None
+
+    packed_mask = np.frombuffer(raw_texture[:mask_size], dtype=np.uint8)
+    mask = np.unpackbits(packed_mask, bitorder='little')[:token_count].astype(np.bool_).reshape(token_height, token_width)
+    raw_indices = raw_texture[mask_size:]
+    if len(raw_indices) != int(mask.sum()):
+        return None
+
+    indices = np.frombuffer(raw_indices, dtype=np.uint8).copy()
+    return torch.from_numpy(mask), torch.from_numpy(indices)
+
+def encode_jpeg(image, quality):
+    ''' Encode one in-memory JPEG candidate for bitrate comparison. '''
+    buffer = io.BytesIO()
+    image.save(buffer, format='JPEG', quality=quality, subsampling=2, optimize=True)
+    return buffer.getvalue()
+
+def make_size_matched_jpeg(image, target_size):
+    ''' Find the JPEG quality whose encoded size is closest to the NIC file. '''
+    low = 1
+    high = 95
+    best_quality = 1
+    best_data = encode_jpeg(image, best_quality)
+    best_difference = abs(len(best_data) - target_size)
+
+    while low <= high:
+        quality = (low + high) // 2
+        data = encode_jpeg(image, quality)
+        difference = abs(len(data) - target_size)
+
+        if difference < best_difference:
+            best_quality = quality
+            best_data = data
+            best_difference = difference
+
+        if len(data) < target_size:
+            low = quality + 1
+        elif len(data) > target_size:
+            high = quality - 1
+        else:
+            break
+
+    for quality in range(max(1, high - 2), min(95, low + 2) + 1):
+        data = encode_jpeg(image, quality)
+        difference = abs(len(data) - target_size)
+        if difference < best_difference:
+            best_quality = quality
+            best_data = data
+            best_difference = difference
+
+    jpeg_image = Image.open(io.BytesIO(best_data)).convert('RGB')
+    return jpeg_image, len(best_data), best_quality
 
 def load_model(checkpoint_path):
     ''' Load a trained image codec checkpoint. '''
@@ -63,39 +151,56 @@ def load_model(checkpoint_path):
     return model, model_id, checkpoint_path, checkpoint['metadata']
 
 def compress_image(input_path, output_path, model, model_id):
-    ''' Compress an image into the NIC file format. '''
+    ''' Compress an image into the NIC file format and build a size-matched JPEG. '''
     input_path = Path(input_path)
     output_path = Path(output_path)
-    image = decode_image(str(input_path), mode='RGB').float().div(255.0)
+    source = decode_image(str(input_path), mode='RGB')
+    jpeg_source = to_pil_image(source)
+    image = source.float().div(255.0)
     height, width = image.shape[-2:]
     pad_height = (-height) % 64
     pad_width = (-width) % 64
     device = next(model.parameters()).device
     image = F.pad(image.unsqueeze(0).to(device), (0, pad_width, 0, pad_height), mode='replicate')
 
-    latent_stream, hyper_stream = model.compress(image)
-    header = HEADER.pack(MAGIC, model_id, width, height, len(latent_stream))
-    output_path.write_bytes(header + latent_stream + hyper_stream)
+    latent_stream, hyper_stream, texture_mask, texture_indices = model.compress(image)
+    texture_stream = pack_texture_tokens(texture_mask, texture_indices)
+    header = HEADER.pack(MAGIC, model_id, width, height, len(latent_stream), len(hyper_stream), len(texture_stream))
+    output_path.write_bytes(header + latent_stream + hyper_stream + texture_stream)
 
     input_size = input_path.stat().st_size
     compressed_size = output_path.stat().st_size
+    jpeg_image, jpeg_size, jpeg_quality = make_size_matched_jpeg(jpeg_source, compressed_size)
     return {
         'input_size': input_size,
         'compressed_size': compressed_size,
         'bpp': compressed_size * 8.0 / (width * height),
         'output_path': output_path,
+        'jpeg_image': jpeg_image,
+        'jpeg_size': jpeg_size,
+        'jpeg_quality': jpeg_quality,
     }
 
 def decompress_image(input_path, model, model_id):
     ''' Reconstruct an image by reading a NIC file from disk. '''
     packed = read_file(input_path)
     if packed is None:
-        return {'error': 'Not a valid NIC3 compressed image.'}
+        return {'error': 'Not a valid NIC4 compressed image.'}
     if packed['model_id'] != model_id:
         return {'error': 'This .nic file was created with a different checkpoint.'}
 
+    try:
+        texture_tokens = unpack_texture_tokens(packed['texture_stream'], packed['width'], packed['height'])
+
+    except zlib.error:
+        texture_tokens = None
+
+    if texture_tokens is None:
+        return {'error': 'The NIC texture stream is invalid.'}
+
+    texture_mask, texture_indices = texture_tokens
     hyper_shape = ((packed['height'] + 63) // 64, (packed['width'] + 63) // 64)
-    reconstruction = model.decompress(packed['latent_stream'], packed['hyper_stream'], hyper_shape)
+    reconstruction = model.decompress(packed['latent_stream'], packed['hyper_stream'], texture_mask, texture_indices, hyper_shape)
     reconstruction = reconstruction[0, :, :packed['height'], :packed['width']]
     reconstruction = reconstruction.mul(255.0).round().to(torch.uint8).cpu()
     return {'width': packed['width'], 'height': packed['height'], 'image': reconstruction}
@@ -207,6 +312,11 @@ class CodecGUI:
         self.reconstruction_image = None
         self.reconstruction_display_image = None
         self.reconstruction_preview = None
+        self.jpeg_image = None
+        self.jpeg_display_image = None
+        self.jpeg_size = None
+        self.jpeg_quality = None
+        self.output_mode = 'Neural'
         self.compressed_path = None
         self.preview_resize_job = None
         self.preview_zoom = 1.0
@@ -302,11 +412,16 @@ class CodecGUI:
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_rowconfigure(3, weight=1)
 
-        ctk.CTkLabel(panel, text='Reconstruction', font=ctk.CTkFont(size=18, weight='bold')).grid(
-            row=0, column=0, sticky='w', padx=18, pady=(18, 8))
+        header = ctk.CTkFrame(panel, fg_color='transparent')
+        header.grid(row=0, column=0, sticky='ew', padx=18, pady=(18, 8))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text='Reconstruction', font=ctk.CTkFont(size=18, weight='bold')).grid(row=0, column=0, sticky='w')
+        self.output_toggle = ctk.CTkSegmentedButton(header, values=['Neural', 'JPEG'], width=160, command=self.change_output_mode)
+        self.output_toggle.set(self.output_mode)
+        self.output_toggle.grid(row=0, column=1, sticky='e')
         ctk.CTkLabel(panel, textvariable=self.output_info_var, anchor='w', text_color='#9c9c9c').grid(
             row=1, column=0, sticky='ew', padx=18)
-        ctk.CTkLabel(panel, text='Decoded from the saved .nic file on disk.', anchor='w', text_color='#6f9fd8').grid(
+        ctk.CTkLabel(panel, text='Toggle between the saved .nic reconstruction and a size-matched JPEG.', anchor='w', text_color='#6f9fd8').grid(
             row=2, column=0, sticky='ew', padx=18, pady=(2, 10))
 
         self.output_preview_frame = ctk.CTkFrame(panel, corner_radius=12, fg_color='#171717')
@@ -404,6 +519,12 @@ class CodecGUI:
         self.reconstruction_image = None
         self.reconstruction_display_image = None
         self.reconstruction_preview = None
+        self.jpeg_image = None
+        self.jpeg_display_image = None
+        self.jpeg_size = None
+        self.jpeg_quality = None
+        self.output_mode = 'Neural'
+        self.output_toggle.set(self.output_mode)
         self.output_info_var.set('Compress and decode an image to compare the reconstruction.')
         self.metrics_var.set('No compression statistics yet')
         self.update_action_states()
@@ -415,7 +536,7 @@ class CodecGUI:
         self.preview_resize_job = self.root.after(PREVIEW_RESIZE_DELAY, self.refresh_previews)
 
     def refresh_previews(self):
-        ''' Render both images from the same fitted or zoomed viewport. '''
+        ''' Render the source and selected comparison from the same shared viewport. '''
         self.preview_resize_job = None
         available_width = min(self.source_preview_frame.winfo_width(), self.output_preview_frame.winfo_width())
         available_height = min(self.source_preview_frame.winfo_height(), self.output_preview_frame.winfo_height())
@@ -425,10 +546,15 @@ class CodecGUI:
                 self.preview_center_x, self.preview_center_y)
             self.source_preview_label.configure(image=self.source_preview, text='')
 
-        if self.reconstruction_display_image is not None:
-            self.reconstruction_preview = make_preview(self.reconstruction_display_image, available_width, available_height, self.preview_zoom,
+        output_image = self.reconstruction_display_image if self.output_mode == 'Neural' else self.jpeg_display_image
+        if output_image is not None:
+            self.reconstruction_preview = make_preview(output_image, available_width, available_height, self.preview_zoom,
                 self.preview_center_x, self.preview_center_y)
             self.output_preview_label.configure(image=self.reconstruction_preview, text='')
+        else:
+            self.reconstruction_preview = None
+            empty_text = 'No reconstruction yet' if self.output_mode == 'Neural' else 'No JPEG comparison yet'
+            self.output_preview_label.configure(image='', text=empty_text)
 
     def bind_preview_events(self, label):
         ''' Bind synchronized zoom and pan controls to an image preview. '''
@@ -440,15 +566,40 @@ class CodecGUI:
         label.bind('<Double-Button-1>', self.reset_viewport)
 
     def change_filter(self, filter_name):
-        ''' Apply one quality inspection filter to both displayed images. '''
+        ''' Apply one quality inspection filter to all cached comparison images. '''
         self.filter_name = filter_name
 
         if self.source_image is not None:
             self.source_display_image = apply_filter(self.source_image, filter_name)
         if self.reconstruction_image is not None:
             self.reconstruction_display_image = apply_filter(self.reconstruction_image, filter_name)
+        if self.jpeg_image is not None:
+            self.jpeg_display_image = apply_filter(self.jpeg_image, filter_name)
 
         self.refresh_previews()
+
+    def change_output_mode(self, output_mode):
+        ''' Switch the right preview between neural and size-matched JPEG output. '''
+        self.output_mode = output_mode
+        self.update_output_info()
+        self.refresh_previews()
+
+    def update_output_info(self):
+        ''' Describe the comparison image currently selected in the right panel. '''
+        if self.output_mode == 'JPEG':
+            if self.jpeg_image is None:
+                self.output_info_var.set('Compress an image to build the JPEG comparison.')
+                return
+
+            width, height = self.jpeg_image.size
+            self.output_info_var.set(f'{width} x {height} pixels | JPEG q{self.jpeg_quality} | {format_file_size(self.jpeg_size)}')
+            return
+
+        if self.reconstruction_image is None:
+            self.output_info_var.set('Decode the saved .nic file to view the neural reconstruction.')
+            return
+
+        self.output_info_var.set(f'{self.reconstruction_image.width} x {self.reconstruction_image.height} pixels | neural reconstruction')
 
     def zoom_preview(self, event):
         ''' Zoom both image previews together. '''
@@ -512,17 +663,24 @@ class CodecGUI:
         self.start_worker(compress_image, self.finish_compress, self.source_path, output_path, self.model, self.model_id)
 
     def finish_compress(self, stats):
-        ''' Display statistics for a completed compression operation. '''
+        ''' Display neural compression statistics and cache the size-matched JPEG. '''
         self.compressed_path = stats['output_path']
+        self.jpeg_image = stats['jpeg_image']
+        self.jpeg_display_image = apply_filter(self.jpeg_image, self.filter_name)
+        self.jpeg_size = stats['jpeg_size']
+        self.jpeg_quality = stats['jpeg_quality']
         ratio = stats['input_size'] / stats['compressed_size']
         reduction = (1.0 - stats['compressed_size'] / stats['input_size']) * 100.0
         original_size = format_file_size(stats['input_size'])
         compressed_size = format_file_size(stats['compressed_size'])
-        metrics_text = f'Original {original_size} | Compressed {compressed_size} | Reduction {reduction:.1f}% | ' \
-            f'Ratio {ratio:.2f}x | {stats["bpp"]:.3f} bpp'
+        jpeg_size = format_file_size(stats['jpeg_size'])
+        metrics_text = f'Original {original_size} | NIC {compressed_size} | Reduction {reduction:.1f}% | Ratio {ratio:.2f}x | ' \
+            f'{stats["bpp"]:.3f} bpp | JPEG {jpeg_size} q{stats["jpeg_quality"]}'
         self.metrics_var.set(metrics_text)
+        self.update_output_info()
+        self.refresh_previews()
         saved_path = self.compressed_path.relative_to(PROJECT_DIR)
-        self.status_var.set(f'Compression complete: {saved_path}. Click Decode to reconstruct it.')
+        self.status_var.set(f'Compression complete: {saved_path}. JPEG comparison ready; click Decode for the neural reconstruction.')
 
     def decode(self):
         ''' Read the saved NIC file from disk and reconstruct its image. '''
@@ -540,8 +698,8 @@ class CodecGUI:
 
         self.reconstruction_image = to_pil_image(stats['image'])
         self.reconstruction_display_image = apply_filter(self.reconstruction_image, self.filter_name)
+        self.update_output_info()
         self.refresh_previews()
-        self.output_info_var.set(f'{stats["width"]} x {stats["height"]} pixels')
         self.status_var.set('Decode complete. The reconstruction was read from the saved .nic file.')
 
     def start_worker(self, function, callback, *args):
@@ -584,6 +742,7 @@ class CodecGUI:
         self.open_button.configure(state='disabled' if busy else 'normal')
         self.checkpoint_button.configure(state='disabled' if busy else 'normal')
         self.filter_menu.configure(state='disabled' if busy else 'normal')
+        self.output_toggle.configure(state='normal' if not busy and self.jpeg_image is not None else 'disabled')
 
         can_compress = not busy and self.model is not None and self.source_path is not None
         can_decode = not busy and self.model is not None and self.compressed_path is not None
