@@ -46,6 +46,7 @@ def prepare_data():
         return None
 
     transform = v2.Compose([
+        v2.ToDtype(torch.uint8, scale=True),
         v2.RandomResizedCrop((256, 256), scale=(0.45, 1.0), ratio=(1.0, 1.0), antialias=True),
         v2.RandomHorizontalFlip(p=0.5)
     ])
