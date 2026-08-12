@@ -1,3 +1,5 @@
+''' Train the neural image codec. '''
+
 import math
 from pathlib import Path
 
@@ -11,9 +13,9 @@ from torchvision.utils import save_image
 
 from model import ImageCodec
 
-DATA_DIR = Path("/path/to/your/images")
-CHECKPOINT_DIR = Path("checkpoints")
-CHECKPOINT_PATH = CHECKPOINT_DIR / "latest.pt"
+DATA_DIR = Path('/path/to/your/images')
+CHECKPOINT_DIR = Path('checkpoints')
+CHECKPOINT_PATH = CHECKPOINT_DIR / 'latest.pt'
 
 IMAGE_SIZE = 256
 BATCH_SIZE = 8
@@ -32,80 +34,80 @@ SAVE_EVERY = 500
 VALIDATION_BATCHES = 8
 SEED = 42
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 
 class ImageDataset(Dataset):
+    ''' Load training images and apply a transform. '''
+
     def __init__(self, paths, transform):
+        ''' Store image paths and the dataset transform. '''
         self.paths = paths
         self.transform = transform
 
     def __len__(self):
+        ''' Return the number of images in the dataset. '''
         return len(self.paths)
 
     def __getitem__(self, index):
-        image = decode_image(str(self.paths[index]), mode="RGB")
+        ''' Load and transform one image. '''
+        image = decode_image(str(self.paths[index]), mode='RGB')
         return self.transform(image)
 
-
 def find_images():
-    paths = []
-    for path in DATA_DIR.rglob("*"):
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
-            paths.append(path)
-    return sorted(paths)
+    ''' Find supported images under the training directory. '''
+    image_paths = []
 
+    for path in DATA_DIR.rglob('*'):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            image_paths.append(path)
+
+    return sorted(image_paths)
 
 def train_transform():
+    ''' Build the training image augmentation pipeline. '''
     return v2.Compose([
-        v2.RandomResizedCrop(
-            (IMAGE_SIZE, IMAGE_SIZE),
-            scale=(0.45, 1.0),
-            ratio=(1.0, 1.0),
-            antialias=True,
-        ),
+        v2.RandomResizedCrop((IMAGE_SIZE, IMAGE_SIZE), scale=(0.45, 1.0), ratio=(1.0, 1.0), antialias=True),
         v2.RandomHorizontalFlip(p=0.5),
-        v2.ToDtype(torch.float32, scale=True),
+        v2.ToDtype(torch.float32, scale=True)
     ])
 
-
 def validation_transform():
+    ''' Build the validation image transform pipeline. '''
     return v2.Compose([
         v2.Resize(int(IMAGE_SIZE * 1.125), antialias=True),
         v2.CenterCrop((IMAGE_SIZE, IMAGE_SIZE)),
-        v2.ToDtype(torch.float32, scale=True),
+        v2.ToDtype(torch.float32, scale=True)
     ])
 
-
 def build_dataloaders():
-    paths = find_images()
-    if len(paths) < 2:
+    ''' Build the training and validation data loaders. '''
+    image_paths = find_images()
+    if len(image_paths) < 2:
         return None, None, 0
 
-    validation_count = max(1, int(len(paths) * VALIDATION_SPLIT))
-    train_count = len(paths) - validation_count
+    validation_count = max(1, int(len(image_paths) * VALIDATION_SPLIT))
+    train_count = len(image_paths) - validation_count
     generator = torch.Generator().manual_seed(SEED)
-    train_paths, validation_paths = random_split(paths, [train_count, validation_count], generator=generator)
+    train_paths, validation_paths = random_split(image_paths, [train_count, validation_count], generator=generator)
 
     train_dataset = ImageDataset(list(train_paths), train_transform())
     validation_dataset = ImageDataset(list(validation_paths), validation_transform())
     loader_options = {
-        "batch_size": BATCH_SIZE,
-        "num_workers": NUM_WORKERS,
-        "pin_memory": True,
-        "persistent_workers": NUM_WORKERS > 0,
+        'batch_size': BATCH_SIZE,
+        'num_workers': NUM_WORKERS,
+        'pin_memory': True,
+        'persistent_workers': NUM_WORKERS > 0,
     }
-
     train_loader = DataLoader(train_dataset, shuffle=True, drop_last=False, **loader_options)
     validation_loader = DataLoader(validation_dataset, shuffle=False, drop_last=False, **loader_options)
-    return train_loader, validation_loader, len(paths)
-
+    return train_loader, validation_loader, len(image_paths)
 
 def count_parameters(model):
+    ''' Count trainable and non-trainable model parameters. '''
     return sum(parameter.numel() for parameter in model.parameters())
 
-
 def evaluate(model, validation_loader, accelerator):
+    ''' Evaluate bitrate and reconstruction error on validation images. '''
     model.eval()
     total_bpp = torch.zeros((), device=accelerator.device)
     total_mse = torch.zeros((), device=accelerator.device)
@@ -117,16 +119,17 @@ def evaluate(model, validation_loader, accelerator):
             total_bpp += bpp
             total_mse += mse
             count += 1
+
             if count >= VALIDATION_BATCHES:
                 break
 
     metrics = torch.stack([total_bpp / count, total_mse / count])
-    metrics = accelerator.reduce(metrics, reduction="mean")
+    metrics = accelerator.reduce(metrics, reduction='mean')
     model.train()
     return metrics[0].item(), metrics[1].item()
 
-
 def save_checkpoint(model, accelerator, step):
+    ''' Save the latest training checkpoint. '''
     accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
         return
@@ -134,59 +137,54 @@ def save_checkpoint(model, accelerator, step):
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     unwrapped = accelerator.unwrap_model(model)
     checkpoint = {
-        "model": unwrapped.state_dict(),
-        "step": step,
-        "parameters": count_parameters(unwrapped),
+        'model': unwrapped.state_dict(),
+        'step': step,
+        'parameters': count_parameters(unwrapped),
     }
     accelerator.save(checkpoint, CHECKPOINT_PATH)
 
-
 def save_preview(images, reconstruction, step, accelerator):
+    ''' Save a grid of source and reconstructed images. '''
     if not accelerator.is_main_process:
         return
 
-    preview_dir = CHECKPOINT_DIR / "previews"
+    preview_dir = CHECKPOINT_DIR / 'previews'
     preview_dir.mkdir(parents=True, exist_ok=True)
     preview = torch.cat([images[:4].float(), reconstruction[:4].float()], dim=0)
-    save_image(preview, preview_dir / f"step_{step:07d}.png", nrow=4)
-
+    save_image(preview, preview_dir / f'step_{step:07d}.png', nrow=4)
 
 def main():
+    ''' Train the codec until the configured step limit. '''
     accelerator = Accelerator()
     set_seed(SEED)
 
     if not DATA_DIR.exists():
         if accelerator.is_main_process:
-            print(f"Set DATA_DIR at the top of train.py first. Current value: {DATA_DIR}")
+            print(f'Set DATA_DIR at the top of train.py first. Current value: {DATA_DIR}')
         return
 
     train_loader, validation_loader, image_count = build_dataloaders()
     if train_loader is None:
         if accelerator.is_main_process:
-            print("The image folder needs at least two JPG, PNG, or WEBP images.")
+            print('The image folder needs at least two JPG, PNG, or WEBP images.')
         return
 
     model = ImageCodec()
-    main_parameters = [parameter for name, parameter in model.named_parameters() if not name.endswith(".quantiles")]
-    aux_parameters = [parameter for name, parameter in model.named_parameters() if name.endswith(".quantiles")]
+    main_parameters = [parameter for name, parameter in model.named_parameters() if not name.endswith('.quantiles')]
+    aux_parameters = [parameter for name, parameter in model.named_parameters() if name.endswith('.quantiles')]
     optimizer = torch.optim.Adam(main_parameters, lr=LEARNING_RATE)
     aux_optimizer = torch.optim.Adam(aux_parameters, lr=AUX_LEARNING_RATE)
-
     model, optimizer, aux_optimizer, train_loader, validation_loader = accelerator.prepare(
-        model,
-        optimizer,
-        aux_optimizer,
-        train_loader,
-        validation_loader,
+        model, optimizer, aux_optimizer, train_loader, validation_loader
     )
-    optimizer_parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+    optimizer_parameters = [parameter for group in optimizer.param_groups for parameter in group['params']]
 
     if accelerator.is_main_process:
         parameters = count_parameters(accelerator.unwrap_model(model))
-        print(f"images: {image_count:,}")
-        print(f"parameters: {parameters / 1e6:.2f}M")
-        print(f"devices: {accelerator.num_processes}")
-        print(f"mixed precision: {accelerator.mixed_precision}")
+        print(f'images: {image_count:,}')
+        print(f'parameters: {parameters / 1e6:.2f}M')
+        print(f'devices: {accelerator.num_processes}')
+        print(f'mixed precision: {accelerator.mixed_precision}')
 
     model.train()
     step = 0
@@ -208,13 +206,11 @@ def main():
 
             if step % LOG_EVERY == 0:
                 metrics = torch.stack([loss.detach(), bpp.detach(), mse.detach()])
-                metrics = accelerator.reduce(metrics, reduction="mean")
+                metrics = accelerator.reduce(metrics, reduction='mean')
                 psnr = -10.0 * math.log10(max(metrics[2].item(), 1e-12))
+
                 if accelerator.is_main_process:
-                    print(
-                        f"step {step:7d} | loss {metrics[0].item():.4f} | "
-                        f"bpp {metrics[1].item():.4f} | psnr {psnr:.2f} dB"
-                    )
+                    print(f'step {step:7d} | loss {metrics[0].item():.4f} | bpp {metrics[1].item():.4f} | psnr {psnr:.2f} dB')
 
             if step % PREVIEW_EVERY == 0:
                 save_preview(images, reconstruction, step, accelerator)
@@ -222,8 +218,10 @@ def main():
             if step % SAVE_EVERY == 0:
                 validation_bpp, validation_mse = evaluate(model, validation_loader, accelerator)
                 validation_psnr = -10.0 * math.log10(max(validation_mse, 1e-12))
+
                 if accelerator.is_main_process:
-                    print(f"validation | bpp {validation_bpp:.4f} | psnr {validation_psnr:.2f} dB")
+                    print(f'validation | bpp {validation_bpp:.4f} | psnr {validation_psnr:.2f} dB')
+
                 save_checkpoint(model, accelerator, step)
 
             if step >= MAX_STEPS:
@@ -231,6 +229,5 @@ def main():
 
     save_checkpoint(model, accelerator, step)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
