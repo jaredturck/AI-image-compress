@@ -6,7 +6,9 @@ from pathlib import Path
 from tkinter import filedialog
 
 import customtkinter as ctk
+import cv2, numpy as np
 import torch, torch.nn.functional as F
+from PIL import Image
 from torchvision.io import decode_image
 from torchvision.transforms.functional import to_pil_image
 
@@ -19,6 +21,9 @@ MAGIC = b'NIC3'
 HEADER = struct.Struct('<4s16sIII')
 PREVIEW_PADDING = 24
 PREVIEW_RESIZE_DELAY = 50
+PREVIEW_ZOOM_STEP = 1.2
+PREVIEW_MAX_ZOOM = 8.0
+FILTERS = ['Original', 'Grayscale', 'Edges', 'Detail']
 
 def read_file(path):
     ''' Read and validate a compressed NIC image file. '''
@@ -45,8 +50,9 @@ def load_model(checkpoint_path):
     if not checkpoint_path.exists():
         return None
 
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     model = ImageCodec()
-    model.load_state_dict(torch.load(checkpoint_path, map_location='cpu', weights_only=True))
+    model.load_state_dict(checkpoint['model'])
     model.update(force=True, update_quantiles=True)
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model.eval().to(device)
@@ -54,7 +60,7 @@ def load_model(checkpoint_path):
     with checkpoint_path.open('rb') as file:
         model_id = hashlib.file_digest(file, 'sha256').digest()[:16]
 
-    return model, model_id, checkpoint_path
+    return model, model_id, checkpoint_path, checkpoint['metadata']
 
 def compress_image(input_path, output_path, model, model_id):
     ''' Compress an image into the NIC file format. '''
@@ -120,14 +126,63 @@ def format_file_size(size):
         return f'{size / 1024:.1f} KB'
     return f'{size} bytes'
 
-def make_preview(image, available_width, available_height):
-    ''' Build a fitted CustomTkinter image without changing codec input. '''
+def apply_filter(image, filter_name):
+    ''' Apply a display-only OpenCV quality inspection filter. '''
+    if filter_name == 'Original':
+        return image
+
+    image_array = np.asarray(image)
+    grayscale = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+
+    if filter_name == 'Grayscale':
+        filtered = grayscale
+    elif filter_name == 'Edges':
+        gradient_x = cv2.Sobel(grayscale, cv2.CV_32F, 1, 0, ksize=3)
+        gradient_y = cv2.Sobel(grayscale, cv2.CV_32F, 0, 1, ksize=3)
+        magnitude = cv2.magnitude(gradient_x, gradient_y)
+        filtered = cv2.convertScaleAbs(magnitude, alpha=0.25)
+    else:
+        laplacian = cv2.Laplacian(grayscale, cv2.CV_16S, ksize=3)
+        filtered = cv2.convertScaleAbs(laplacian)
+
+    filtered = cv2.cvtColor(filtered, cv2.COLOR_GRAY2RGB)
+    return Image.fromarray(filtered)
+
+def get_preview_scale(image, available_width, available_height, zoom):
+    ''' Calculate the source-to-preview scale for the shared viewport. '''
     available_width = max(1, available_width - PREVIEW_PADDING)
     available_height = max(1, available_height - PREVIEW_PADDING)
-    scale = min(available_width / image.width, available_height / image.height, 1.0)
-    size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
-    preview = image.copy()
-    preview.thumbnail(size)
+    return min(available_width / image.width, available_height / image.height) * zoom
+
+def get_preview_center_limits(image, available_width, available_height, zoom):
+    ''' Calculate valid normalized viewport center limits. '''
+    available_width = max(1, available_width - PREVIEW_PADDING)
+    available_height = max(1, available_height - PREVIEW_PADDING)
+    display_scale = min(available_width / image.width, available_height / image.height) * zoom
+    visible_width = min(float(image.width), available_width / display_scale)
+    visible_height = min(float(image.height), available_height / display_scale)
+    x_margin = visible_width / (2.0 * image.width)
+    y_margin = visible_height / (2.0 * image.height)
+    return x_margin, 1.0 - x_margin, y_margin, 1.0 - y_margin
+
+def make_preview(image, available_width, available_height, zoom, center_x, center_y):
+    ''' Build a fitted or zoomed CustomTkinter image from the shared viewport. '''
+    available_width = max(1, available_width - PREVIEW_PADDING)
+    available_height = max(1, available_height - PREVIEW_PADDING)
+    display_scale = min(available_width / image.width, available_height / image.height) * zoom
+    visible_width = min(float(image.width), available_width / display_scale)
+    visible_height = min(float(image.height), available_height / display_scale)
+    left = center_x * image.width - visible_width / 2.0
+    top = center_y * image.height - visible_height / 2.0
+    left = max(0.0, min(left, image.width - visible_width))
+    top = max(0.0, min(top, image.height - visible_height))
+    right = min(image.width, left + visible_width)
+    bottom = min(image.height, top + visible_height)
+    crop_box = (int(round(left)), int(round(top)), int(round(right)), int(round(bottom)))
+    preview = image.crop(crop_box)
+    target_width = max(1, min(available_width, int(round(preview.width * display_scale))))
+    target_height = max(1, min(available_height, int(round(preview.height * display_scale))))
+    preview = preview.resize((target_width, target_height), Image.Resampling.LANCZOS)
     return ctk.CTkImage(light_image=preview, dark_image=preview, size=preview.size)
 
 class CodecGUI:
@@ -147,11 +202,19 @@ class CodecGUI:
         self.checkpoint_path = None
         self.source_path = None
         self.source_image = None
+        self.source_display_image = None
         self.source_preview = None
         self.reconstruction_image = None
+        self.reconstruction_display_image = None
         self.reconstruction_preview = None
         self.compressed_path = None
         self.preview_resize_job = None
+        self.preview_zoom = 1.0
+        self.preview_center_x = 0.5
+        self.preview_center_y = 0.5
+        self.pan_x = 0
+        self.pan_y = 0
+        self.filter_name = 'Original'
         self.worker_pool = ThreadPoolExecutor(max_workers=1)
         self.worker_future = None
         self.worker_callback = None
@@ -160,7 +223,7 @@ class CodecGUI:
         self.source_name_var = tk.StringVar(value='No image selected')
         self.source_info_var = tk.StringVar(value='Open an image to begin.')
         self.output_info_var = tk.StringVar(value='Compress and decode an image to compare the reconstruction.')
-        self.checkpoint_var = tk.StringVar(value='No checkpoint loaded')
+        self.checkpoint_var = tk.StringVar(value='Checkpoint: No checkpoint loaded')
         self.metrics_var = tk.StringVar(value='No compression statistics yet')
 
         self.build_header()
@@ -182,10 +245,13 @@ class CodecGUI:
 
         checkpoint_frame = ctk.CTkFrame(header, fg_color='transparent')
         checkpoint_frame.grid(row=0, column=1, sticky='e', padx=24, pady=16)
-        ctk.CTkLabel(checkpoint_frame, text='Checkpoint', text_color='#9c9c9c').grid(row=0, column=0, sticky='e', padx=(0, 10))
-        ctk.CTkLabel(checkpoint_frame, textvariable=self.checkpoint_var, width=220, anchor='e').grid(row=0, column=1, sticky='e', padx=(0, 10))
+        ctk.CTkLabel(checkpoint_frame, textvariable=self.checkpoint_var, text_color='#b5b5b5').grid(row=0, column=0, sticky='e', padx=(0, 18))
+        ctk.CTkLabel(checkpoint_frame, text='Filter:', text_color='#9c9c9c').grid(row=0, column=1, sticky='e', padx=(0, 6))
+        self.filter_menu = ctk.CTkOptionMenu(checkpoint_frame, values=FILTERS, width=110, command=self.change_filter)
+        self.filter_menu.set(self.filter_name)
+        self.filter_menu.grid(row=0, column=2, sticky='e', padx=(0, 10))
         self.checkpoint_button = ctk.CTkButton(checkpoint_frame, text='Change', width=90, command=self.browse_checkpoint)
-        self.checkpoint_button.grid(row=0, column=2)
+        self.checkpoint_button.grid(row=0, column=3)
 
     def build_panels(self):
         ''' Build the side-by-side source and reconstruction panels. '''
@@ -224,6 +290,7 @@ class CodecGUI:
         self.source_preview_frame.bind('<Configure>', self.schedule_preview_resize)
         self.source_preview_label = ctk.CTkLabel(self.source_preview_frame, text='No source image', text_color='#777777')
         self.source_preview_label.grid(row=0, column=0, sticky='nsew', padx=12, pady=12)
+        self.bind_preview_events(self.source_preview_label)
 
         self.compress_button = ctk.CTkButton(panel, text='Compress', height=42, state='disabled', command=self.compress)
         self.compress_button.grid(row=4, column=0, sticky='ew', padx=18, pady=(0, 18))
@@ -249,6 +316,7 @@ class CodecGUI:
         self.output_preview_frame.bind('<Configure>', self.schedule_preview_resize)
         self.output_preview_label = ctk.CTkLabel(self.output_preview_frame, text='No reconstruction yet', text_color='#777777')
         self.output_preview_label.grid(row=0, column=0, sticky='nsew', padx=12, pady=12)
+        self.bind_preview_events(self.output_preview_label)
 
         metrics = ctk.CTkLabel(panel, textvariable=self.metrics_var, anchor='w', height=30, corner_radius=8,
             fg_color='#303030', text_color='#b5b5b5', font=ctk.CTkFont(size=12))
@@ -292,8 +360,8 @@ class CodecGUI:
             self.status_var.set('Checkpoint file not found.')
             return
 
-        self.model, self.model_id, self.checkpoint_path = loaded
-        self.checkpoint_var.set(self.checkpoint_path.name)
+        self.model, self.model_id, self.checkpoint_path, metadata = loaded
+        self.checkpoint_var.set(f'Checkpoint: {self.checkpoint_path.name}, loss {metadata["loss"]:.4f}, {metadata["dataset_images"]:,} images')
         self.clear_compressed_result()
         device = next(self.model.parameters()).device
         self.status_var.set(f'Loaded {self.checkpoint_path.name} on {device}.')
@@ -317,10 +385,14 @@ class CodecGUI:
 
         self.source_path = Path(path)
         self.source_image = to_pil_image(image)
-        self.refresh_previews()
+        self.source_display_image = apply_filter(self.source_image, self.filter_name)
+        self.preview_zoom = 1.0
+        self.preview_center_x = 0.5
+        self.preview_center_y = 0.5
         self.source_name_var.set(self.source_path.name)
         self.source_info_var.set(f'{image.shape[2]} x {image.shape[1]} pixels | original dimensions preserved')
         self.clear_compressed_result()
+        self.refresh_previews()
         self.status_var.set('Image ready. Click Compress to create the .nic file.')
         self.update_action_states()
 
@@ -330,6 +402,7 @@ class CodecGUI:
         # CustomTkinter leaves the underlying Tk image unchanged when image=None.
         self.output_preview_label.configure(image='', text='No reconstruction yet')
         self.reconstruction_image = None
+        self.reconstruction_display_image = None
         self.reconstruction_preview = None
         self.output_info_var.set('Compress and decode an image to compare the reconstruction.')
         self.metrics_var.set('No compression statistics yet')
@@ -342,17 +415,90 @@ class CodecGUI:
         self.preview_resize_job = self.root.after(PREVIEW_RESIZE_DELAY, self.refresh_previews)
 
     def refresh_previews(self):
-        ''' Fit complete source and reconstruction images inside their preview areas. '''
+        ''' Render both images from the same fitted or zoomed viewport. '''
         self.preview_resize_job = None
+        available_width = min(self.source_preview_frame.winfo_width(), self.output_preview_frame.winfo_width())
+        available_height = min(self.source_preview_frame.winfo_height(), self.output_preview_frame.winfo_height())
 
-        if self.source_image is not None:
-            self.source_preview = make_preview(self.source_image, self.source_preview_frame.winfo_width(), self.source_preview_frame.winfo_height())
+        if self.source_display_image is not None:
+            self.source_preview = make_preview(self.source_display_image, available_width, available_height, self.preview_zoom,
+                self.preview_center_x, self.preview_center_y)
             self.source_preview_label.configure(image=self.source_preview, text='')
 
-        if self.reconstruction_image is not None:
-            self.reconstruction_preview = make_preview(self.reconstruction_image, self.output_preview_frame.winfo_width(),
-                self.output_preview_frame.winfo_height())
+        if self.reconstruction_display_image is not None:
+            self.reconstruction_preview = make_preview(self.reconstruction_display_image, available_width, available_height, self.preview_zoom,
+                self.preview_center_x, self.preview_center_y)
             self.output_preview_label.configure(image=self.reconstruction_preview, text='')
+
+    def bind_preview_events(self, label):
+        ''' Bind synchronized zoom and pan controls to an image preview. '''
+        label.bind('<MouseWheel>', self.zoom_preview)
+        label.bind('<Button-4>', self.zoom_preview)
+        label.bind('<Button-5>', self.zoom_preview)
+        label.bind('<ButtonPress-1>', self.start_pan)
+        label.bind('<B1-Motion>', self.pan_preview)
+        label.bind('<Double-Button-1>', self.reset_viewport)
+
+    def change_filter(self, filter_name):
+        ''' Apply one quality inspection filter to both displayed images. '''
+        self.filter_name = filter_name
+
+        if self.source_image is not None:
+            self.source_display_image = apply_filter(self.source_image, filter_name)
+        if self.reconstruction_image is not None:
+            self.reconstruction_display_image = apply_filter(self.reconstruction_image, filter_name)
+
+        self.refresh_previews()
+
+    def zoom_preview(self, event):
+        ''' Zoom both image previews together. '''
+        if self.source_display_image is None:
+            return 'break'
+
+        zoom_in = getattr(event, 'num', 0) == 4 or getattr(event, 'delta', 0) > 0
+        if zoom_in:
+            self.preview_zoom = min(PREVIEW_MAX_ZOOM, self.preview_zoom * PREVIEW_ZOOM_STEP)
+        else:
+            self.preview_zoom = max(1.0, self.preview_zoom / PREVIEW_ZOOM_STEP)
+
+        available_width = min(self.source_preview_frame.winfo_width(), self.output_preview_frame.winfo_width())
+        available_height = min(self.source_preview_frame.winfo_height(), self.output_preview_frame.winfo_height())
+        min_x, max_x, min_y, max_y = get_preview_center_limits(self.source_display_image, available_width, available_height, self.preview_zoom)
+        self.preview_center_x = max(min_x, min(max_x, self.preview_center_x))
+        self.preview_center_y = max(min_y, min(max_y, self.preview_center_y))
+        self.refresh_previews()
+        return 'break'
+
+    def start_pan(self, event):
+        ''' Start dragging the shared image viewport. '''
+        self.pan_x = event.x_root
+        self.pan_y = event.y_root
+
+    def pan_preview(self, event):
+        ''' Pan both image previews together while zoomed. '''
+        if self.source_display_image is None or self.preview_zoom <= 1.0:
+            return
+
+        delta_x = event.x_root - self.pan_x
+        delta_y = event.y_root - self.pan_y
+        self.pan_x = event.x_root
+        self.pan_y = event.y_root
+        available_width = min(self.source_preview_frame.winfo_width(), self.output_preview_frame.winfo_width())
+        available_height = min(self.source_preview_frame.winfo_height(), self.output_preview_frame.winfo_height())
+        display_scale = get_preview_scale(self.source_display_image, available_width, available_height, self.preview_zoom)
+        display_width = self.source_display_image.width * display_scale
+        display_height = self.source_display_image.height * display_scale
+        min_x, max_x, min_y, max_y = get_preview_center_limits(self.source_display_image, available_width, available_height, self.preview_zoom)
+        self.preview_center_x = max(min_x, min(max_x, self.preview_center_x - delta_x / display_width))
+        self.preview_center_y = max(min_y, min(max_y, self.preview_center_y - delta_y / display_height))
+        self.refresh_previews()
+
+    def reset_viewport(self, _event=None):
+        ''' Reset synchronized image inspection to the fitted full-image view. '''
+        self.preview_zoom = 1.0
+        self.preview_center_x = 0.5
+        self.preview_center_y = 0.5
+        self.refresh_previews()
 
     def compress(self):
         ''' Compress the selected source image into the project output folder. '''
@@ -393,6 +539,7 @@ class CodecGUI:
             return
 
         self.reconstruction_image = to_pil_image(stats['image'])
+        self.reconstruction_display_image = apply_filter(self.reconstruction_image, self.filter_name)
         self.refresh_previews()
         self.output_info_var.set(f'{stats["width"]} x {stats["height"]} pixels')
         self.status_var.set('Decode complete. The reconstruction was read from the saved .nic file.')
@@ -436,6 +583,7 @@ class CodecGUI:
         busy = self.worker_future is not None
         self.open_button.configure(state='disabled' if busy else 'normal')
         self.checkpoint_button.configure(state='disabled' if busy else 'normal')
+        self.filter_menu.configure(state='disabled' if busy else 'normal')
 
         can_compress = not busy and self.model is not None and self.source_path is not None
         can_decode = not busy and self.model is not None and self.compressed_path is not None

@@ -184,11 +184,12 @@ def load_checkpoint(model):
         return None
 
     checkpoint_path = max(checkpoints, key=lambda path: path.stat().st_mtime)
-    model.load_state_dict(torch.load(checkpoint_path, map_location='cpu', weights_only=True))
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    model.load_state_dict(checkpoint['model'])
     return checkpoint_path
 
-def save_checkpoint(model, accelerator):
-    ''' Save a checkpoint in a three-file rolling window. '''
+def save_checkpoint(model, accelerator, loss, dataset_images, step):
+    ''' Save a checkpoint and training metadata in a three-file rolling window. '''
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     checkpoints = list(CHECKPOINT_DIR.glob('checkpoint_*.pt'))
     checkpoint_path = None
@@ -202,8 +203,14 @@ def save_checkpoint(model, accelerator):
     if checkpoint_path is None:
         checkpoint_path = min(checkpoints, key=lambda path: path.stat().st_mtime)
 
+    metadata = {
+        'loss': loss,
+        'dataset_images': dataset_images,
+        'images_seen': step * BATCH_SIZE * accelerator.num_processes,
+        'steps': step,
+    }
     temporary_path = CHECKPOINT_DIR / '.checkpoint.tmp'
-    torch.save(accelerator.unwrap_model(model).state_dict(), temporary_path)
+    torch.save({'model': accelerator.unwrap_model(model).state_dict(), 'metadata': metadata}, temporary_path)
     os.replace(temporary_path, checkpoint_path)
 
 def main():
@@ -220,6 +227,9 @@ def main():
     if train_loader is None:
         return
 
+    dataset_images = torch.tensor(len(train_loader.dataset), device=accelerator.device)
+    dataset_images = int(accelerator.reduce(dataset_images, reduction='sum').item())
+
     model = ImageCodec()
     checkpoint_path = load_checkpoint(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, fused=True)
@@ -235,6 +245,7 @@ def main():
     loss_count = 0
     stop_checks = 0
     best_average_loss = None
+    latest_average_loss = None
     should_stop = False
     loss_sum = torch.zeros((), device=accelerator.device)
     last_log = time.monotonic()
@@ -257,6 +268,7 @@ def main():
             if loss_count >= STOP_CHECK_INTERVAL:
                 average_loss = accelerator.reduce(loss_sum / loss_count, reduction='mean')
                 average_loss_value = average_loss.item()
+                latest_average_loss = average_loss_value
                 loss_sum.zero_()
                 loss_count = 0
 
@@ -284,7 +296,7 @@ def main():
                     last_log = current_time
 
                     if current_time - last_save >= 300:
-                        save_checkpoint(model, accelerator)
+                        save_checkpoint(model, accelerator, latest_average_loss, dataset_images, step)
                         last_save = current_time
 
             if step >= MAX_STEPS or should_stop:
@@ -293,7 +305,7 @@ def main():
         epoch += 1
 
     if accelerator.is_main_process:
-        save_checkpoint(model, accelerator)
+        save_checkpoint(model, accelerator, latest_average_loss, dataset_images, step)
 
 if __name__ == '__main__':
     main()
