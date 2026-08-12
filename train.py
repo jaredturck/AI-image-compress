@@ -1,6 +1,6 @@
 ''' Train the neural image codec. '''
 
-import math, os, queue, random, threading, time
+import os, queue, random, threading, time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
@@ -192,15 +192,16 @@ def main():
 
     if accelerator.is_main_process:
         weights = checkpoint_path.name if checkpoint_path else 'random'
-        print(f'Training started | batch size {BATCH_SIZE} | {MAX_STEPS:,} batches | weights {weights}')
+        print(f'Training started | batch size {BATCH_SIZE} | weights {weights}')
 
     model.train()
     step = 0
+    epoch = 1
     last_log = time.monotonic()
     last_save = last_log
 
     while step < MAX_STEPS:
-        for batch in train_loader:
+        for batch_number, batch in enumerate(train_loader, 1):
             batch = batch.to(accelerator.device, non_blocking=True).float().mul_(1.0 / 255.0)
             optimizer.zero_grad()
             reconstruction, bpp = model(batch)
@@ -213,10 +214,9 @@ def main():
 
             if accelerator.is_main_process:
                 current_time = time.monotonic()
+
                 if current_time - last_log >= 20:
-                    loss_value, bpp_value, mse_value = torch.stack([loss.detach(), bpp.detach(), mse.detach()]).tolist()
-                    psnr = -10.0 * math.log10(max(mse_value, 1e-12))
-                    print(f'step {step:7d} | loss {loss_value:.4f} | bpp {bpp_value:.4f} | psnr {psnr:.2f} dB')
+                    print(f'Epoch {epoch}, batch {batch_number} of {len(train_loader)}, loss={loss.item():.4f}')
                     last_log = current_time
 
                     if current_time - last_save >= 300:
@@ -225,6 +225,8 @@ def main():
 
             if step >= MAX_STEPS:
                 break
+
+        epoch += 1
 
     if accelerator.is_main_process:
         save_checkpoint(model, accelerator)
