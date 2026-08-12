@@ -9,15 +9,8 @@ from torchvision.io import decode_image, write_png
 
 from model import ImageCodec
 
-MAGIC = b'NIC2'
-VERSION = 2
-HEADER = struct.Struct('<4sB16sIIIIII')
-
-def write_file(path, model_id, width, height, shape, latent_stream, hyper_stream):
-    ''' Write a compressed NIC image file. '''
-    hyper_height, hyper_width = shape
-    header = HEADER.pack(MAGIC, VERSION, model_id, width, height, hyper_width, hyper_height, len(latent_stream), len(hyper_stream))
-    Path(path).write_bytes(header + latent_stream + hyper_stream)
+MAGIC = b'NIC3'
+HEADER = struct.Struct('<4s16sIII')
 
 def read_file(path):
     ''' Read and validate a compressed NIC image file. '''
@@ -25,10 +18,8 @@ def read_file(path):
     if len(data) < HEADER.size:
         return None
 
-    magic, version, model_id, width, height, hyper_width, hyper_height, latent_size, hyper_size = HEADER.unpack_from(data)
-    if magic != MAGIC or version != VERSION:
-        return None
-    if len(data) != HEADER.size + latent_size + hyper_size:
+    magic, model_id, width, height, latent_size = HEADER.unpack_from(data)
+    if magic != MAGIC or latent_size > len(data) - HEADER.size:
         return None
 
     offset = HEADER.size
@@ -36,68 +27,48 @@ def read_file(path):
         'model_id': model_id,
         'width': width,
         'height': height,
-        'shape': (hyper_height, hyper_width),
         'latent_stream': data[offset:offset + latent_size],
         'hyper_stream': data[offset + latent_size:],
-        'file_size': len(data),
     }
 
-def checkpoint_id(checkpoint_path):
-    ''' Generate a compact identifier for a checkpoint file. '''
-    digest = hashlib.sha256()
-
-    with Path(checkpoint_path).open('rb') as file:
-        while True:
-            block = file.read(1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-
-    return digest.digest()[:16]
-
-def pad_image(image):
-    ''' Pad an image to dimensions compatible with the codec. '''
-    height, width = image.shape[-2:]
-    pad_height = (-height) % 64
-    pad_width = (-width) % 64
-    return F.pad(image, (0, pad_width, 0, pad_height), mode='replicate')
-
-def load_model(checkpoint_path, device=None):
+def load_model(checkpoint_path):
     ''' Load a trained image codec checkpoint. '''
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists():
         return None
 
-    if device is None:
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     model = ImageCodec()
-    model.load_state_dict(checkpoint['model'])
+    model.load_state_dict(torch.load(checkpoint_path, map_location='cpu', weights_only=True))
     model.update(force=True)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model.eval().to(device)
-    return model, checkpoint_id(checkpoint_path), device
 
-def compress_image(input_path, output_path, model, model_id, device):
+    with checkpoint_path.open('rb') as file:
+        model_id = hashlib.file_digest(file, 'sha256').digest()[:16]
+
+    return model, model_id
+
+def compress_image(input_path, output_path, model, model_id):
     ''' Compress an image into the NIC file format. '''
     input_path = Path(input_path)
     output_path = Path(output_path)
     image = decode_image(str(input_path), mode='RGB').float().div(255.0)
     height, width = image.shape[-2:]
-    image = pad_image(image.unsqueeze(0).to(device))
+    pad_height = (-height) % 64
+    pad_width = (-width) % 64
+    device = next(model.parameters()).device
+    image = F.pad(image.unsqueeze(0).to(device), (0, pad_width, 0, pad_height), mode='replicate')
 
-    packed = model.compress(image)
-    latent_stream = packed['strings'][0][0]
-    hyper_stream = packed['strings'][1][0]
-    write_file(output_path, model_id, width, height, packed['shape'], latent_stream, hyper_stream)
+    latent_stream, hyper_stream = model.compress(image)
+    header = HEADER.pack(MAGIC, model_id, width, height, len(latent_stream))
+    output_path.write_bytes(header + latent_stream + hyper_stream)
 
-    file_size = output_path.stat().st_size
+    input_size = input_path.stat().st_size
+    compressed_size = output_path.stat().st_size
     return {
-        'input_size': input_path.stat().st_size,
-        'compressed_size': file_size,
-        'bpp': file_size * 8.0 / (width * height),
-        'width': width,
-        'height': height,
+        'input_size': input_size,
+        'compressed_size': compressed_size,
+        'bpp': compressed_size * 8.0 / (width * height),
     }
 
 def decompress_image(input_path, output_path, model, model_id):
@@ -105,22 +76,16 @@ def decompress_image(input_path, output_path, model, model_id):
     output_path = Path(output_path)
     packed = read_file(input_path)
     if packed is None:
-        return {'error': 'Not a valid NIC2 compressed image.'}
+        return {'error': 'Not a valid NIC3 compressed image.'}
     if packed['model_id'] != model_id:
         return {'error': 'This .nic file was created with a different checkpoint.'}
 
-    strings = [[packed['latent_stream']], [packed['hyper_stream']]]
-    reconstruction = model.decompress(strings, packed['shape'])
+    hyper_shape = ((packed['height'] + 63) // 64, (packed['width'] + 63) // 64)
+    reconstruction = model.decompress(packed['latent_stream'], packed['hyper_stream'], hyper_shape)
     reconstruction = reconstruction[0, :, :packed['height'], :packed['width']]
     reconstruction = reconstruction.mul(255.0).round().to(torch.uint8).cpu()
     write_png(reconstruction, str(output_path))
-
-    return {
-        'compressed_size': packed['file_size'],
-        'output_size': output_path.stat().st_size,
-        'width': packed['width'],
-        'height': packed['height'],
-    }
+    return {'width': packed['width'], 'height': packed['height']}
 
 class CodecGUI:
     ''' Provide a small desktop interface for compression and decompression. '''
@@ -134,7 +99,6 @@ class CodecGUI:
 
         self.model = None
         self.model_id = None
-        self.device = None
         self.checkpoint_var = tk.StringVar(value='checkpoints/latest.pt')
         self.status_var = tk.StringVar(value='Load a trained checkpoint first.')
 
@@ -167,10 +131,10 @@ class CodecGUI:
             self.status_var.set('Checkpoint file not found.')
             return
 
-        self.model, self.model_id, self.device = loaded
+        self.model, self.model_id = loaded
         self.compress_button.config(state='normal')
         self.decompress_button.config(state='normal')
-        self.status_var.set(f'Loaded checkpoint on {self.device}.')
+        self.status_var.set(f'Loaded checkpoint on {next(self.model.parameters()).device}.')
 
     def compress(self):
         ''' Choose an image and compress it. '''
@@ -185,7 +149,7 @@ class CodecGUI:
 
         self.status_var.set('Compressing...')
         self.root.update_idletasks()
-        stats = compress_image(input_path, output_path, self.model, self.model_id, self.device)
+        stats = compress_image(input_path, output_path, self.model, self.model_id)
         ratio = stats['input_size'] / max(stats['compressed_size'], 1)
         self.status_var.set(f'Compressed to {stats["compressed_size"]:,} bytes ({stats["bpp"]:.3f} bpp). '
             f'Source-file ratio: {ratio:.2f}x.\n{output_path}')
