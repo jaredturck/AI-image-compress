@@ -9,6 +9,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 from torch.utils.data import DataLoader
 from torchvision.io import decode_image
 from torchvision.transforms import v2
+from tqdm import tqdm
 
 from model import ImageCodec
 
@@ -41,7 +42,7 @@ def prepare_data(accelerator):
     cache = torch.empty((len(filenames), 3, 256, 256), dtype=torch.uint8)
     cache_size = 0
 
-    for filename in filenames:
+    for filename in tqdm(filenames, desc='Preparing images', unit='image', disable=not accelerator.is_main_process):
         try:
             image = decode_image(str(DATA_DIR / filename), mode='RGB')
             cache[cache_size].copy_(transform(image))
