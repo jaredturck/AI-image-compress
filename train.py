@@ -21,9 +21,10 @@ LAMBDA = 0.010
 MAX_STEPS = 15000
 MAX_IMAGES = 50_000
 BATCH_SIZE = 32
-STOP_LOSS = 1.0
 STOP_CHECK_INTERVAL = 100
-STOP_PATIENCE = 3
+STOP_MIN_DELTA = 0.01
+STOP_PATIENCE = 5
+STOP_MIN_STEPS = 1000
 IMAGE_SIZE = 256
 JPEG_BATCH_SIZE = 64
 MAX_JPEG_FUTURES = 4
@@ -209,6 +210,11 @@ def main():
     torch.backends.cudnn.benchmark = True
     ddp_config = DistributedDataParallelKwargs(broadcast_buffers=False, bucket_cap_mb=10, gradient_as_bucket_view=True, static_graph=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_config])
+    gpu_count = torch.cuda.device_count()
+
+    if accelerator.is_main_process and gpu_count > 1 and accelerator.num_processes == 1:
+        print(f'Warning: {gpu_count} CUDA GPUs detected but only one training process is active. Did you forget to run with Accelerate?')
+
     train_loader = prepare_data(accelerator)
     if train_loader is None:
         return
@@ -227,6 +233,7 @@ def main():
     epoch = 1
     loss_count = 0
     stop_checks = 0
+    best_average_loss = None
     should_stop = False
     loss_sum = torch.zeros((), device=accelerator.device)
     last_log = time.monotonic()
@@ -252,15 +259,21 @@ def main():
                 loss_sum.zero_()
                 loss_count = 0
 
-                if average_loss_value < STOP_LOSS:
-                    stop_checks += 1
-                else:
+                if step < STOP_MIN_STEPS:
+                    best_average_loss = average_loss_value
                     stop_checks = 0
+                elif best_average_loss is None:
+                    best_average_loss = average_loss_value
+                elif best_average_loss - average_loss_value >= STOP_MIN_DELTA:
+                    best_average_loss = average_loss_value
+                    stop_checks = 0
+                else:
+                    stop_checks += 1
 
                 if stop_checks >= STOP_PATIENCE:
                     should_stop = True
                     if accelerator.is_main_process:
-                        print(f'Stopping early | average loss {average_loss_value:.4f} below {STOP_LOSS:.4f} for {STOP_PATIENCE} checks')
+                        print(f'Stopping early | average loss {average_loss_value:.4f} | no improvement of {STOP_MIN_DELTA:.4f} for {STOP_PATIENCE} checks')
 
             if accelerator.is_main_process:
                 current_time = time.monotonic()
